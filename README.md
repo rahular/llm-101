@@ -14,7 +14,7 @@ PyTorch kernel that executes the code cells (port **8177**, needs `pip install t
 **Quick start — one command:**
 
 ```bash
-cd /Users/aralikatte/code/random/prep
+cd /Users/aralikatte/code/random/llm-101
 ./start.sh          # starts both in the background (logs in /tmp/prep-*.log)
 ./start.sh stop     # stops both
 ```
