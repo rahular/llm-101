@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Standard Transformer (code) · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="code-standard-gpt">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Code</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 17 · Code</div>
+          <h1>Standard Transformer</h1>
+          <p class="lead">
+            A complete, readable decoder-only GPT in PyTorch — the nanoGPT lineage. Read it top to
+            bottom: config → attention → MLP → block → model. Every piece maps to the concepts on
+            <a href="attention.html">Attention</a> and <a href="transformer-internals.html">Transformer
+            Internals</a>; this page is the working code for them. Use the <em>copy</em> button on any
+            block to paste it into your editor and run it.
+          </p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">How to use this section</div>
+          <p>
+            These blocks are <strong>PyTorch</strong> (which can't run in the browser), so they're for
+            reading and copying. The occasional green <em>Run</em> cell is a runnable PyTorch check
+            against the local kernel. Pair this with the <code>Local exercise</code> prompts to actually train it.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. Config</h2>
+        <p>A dataclass holding the hyperparameters every module reads from.</p>
+        <div class="code-view" data-file="model.py">
+<script type="text/x-python">
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from dataclasses import dataclass
+
+@dataclass
+class GPTConfig:
+    vocab_size: int = 50304   # padded to a multiple of 64 for GPU efficiency
+    max_seqlen: int = 1024    # maximum context length
+    n_layer: int = 12
+    n_heads: int = 12
+    d_model: int = 768        # model dimension (must be divisible by n_heads)
+    dropout: float = 0.0
+</script>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. Causal self-attention</h2>
+        <p>
+          The heart of the model. One fused <code>QKV</code> projection, reshape into heads, scaled
+          dot-product with a <strong>causal mask</strong> (positions can't see the future), softmax,
+          weighted sum of values, then re-assemble heads and project out. Shapes are annotated at every
+          step — narrating shapes is the habit that keeps transformer code correct.
+        </p>
+        <div class="code-view" data-file="model.py">
+<script type="text/x-python">
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        assert cfg.d_model % cfg.n_heads == 0
+        self.n_heads = cfg.n_heads
+        self.d_model = cfg.d_model
+        self.dropout = cfg.dropout
+        # fused projection producing Q, K, V in one matmul, then the output proj
+        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
+        self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        # lower-triangular causal mask, stored as a buffer (moves with .to(device),
+        # but is not a learnable parameter)
+        mask = torch.tril(torch.ones(cfg.max_seqlen, cfg.max_seqlen))
+        self.register_buffer("mask", mask.view(1, 1, cfg.max_seqlen, cfg.max_seqlen))
+
+    def forward(self, x):
+        batch, seqlen, d_model = x.shape         # batch, sequence length, model dimension
+        head_dim = d_model // self.n_heads       # per-head dimension
+        q, k, v = self.qkv(x).split(self.d_model, dim=2)
+        # (batch, seqlen, d_model) -> (batch, n_heads, seqlen, head_dim)
+        q = q.view(batch, seqlen, self.n_heads, head_dim).transpose(1, 2)
+        k = k.view(batch, seqlen, self.n_heads, head_dim).transpose(1, 2)
+        v = v.view(batch, seqlen, self.n_heads, head_dim).transpose(1, 2)
+
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(head_dim)    # (batch, n_heads, seqlen, seqlen)
+        att = att.masked_fill(self.mask[:, :, :seqlen, :seqlen] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)                             # row-wise over keys
+        att = F.dropout(att, p=self.dropout, training=self.training)
+        y = att @ v                                              # (batch, n_heads, seqlen, head_dim)
+
+        y = y.transpose(1, 2).contiguous().view(batch, seqlen, d_model)   # re-assemble heads
+        return self.proj(y)
+</script>
+        </div>
+        <div class="callout gotcha">
+          <div class="callout-title">⚠️ In production, use SDPA</div>
+          <p>
+            The explicit scores → mask → softmax above is written for clarity. Real code replaces it with
+            <code>F.scaled_dot_product_attention(q, k, v, is_causal=True)</code>, which dispatches to a
+            fused FlashAttention kernel — same math, far less memory and HBM traffic (see
+            <a href="attention.html">Attention: Scratch → Efficient</a>). The next page uses SDPA.
+          </p>
+        </div>
+
+        <div class="code-cell" data-id="csg-causal">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Verify the mask really is causal (PyTorch)</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+import torch.nn.functional as F
+torch.manual_seed(0)
+
+seqlen, head_dim = 5, 8
+q = torch.randn(seqlen, head_dim); k = torch.randn(seqlen, head_dim)
+att = q @ k.T / head_dim ** 0.5
+mask = torch.tril(torch.ones(seqlen, seqlen))       # 1 on/below diagonal
+att = att.masked_fill(mask == 0, float('-inf'))
+w = F.softmax(att, dim=-1)
+print("attention weights (row t attends only to cols <= t):")
+print(w.round(decimals=2))
+print("upper triangle all zero:", torch.allclose(torch.triu(w, 1), torch.zeros(seqlen, seqlen)))</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. The MLP</h2>
+        <p>
+          A two-layer feed-forward network with a 4× hidden expansion and a GELU nonlinearity — where
+          most of a transformer's parameters live.
+        </p>
+        <div class="code-view" data-file="model.py">
+<script type="text/x-python">
+class MLP(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.fc = nn.Linear(cfg.d_model, 4 * cfg.d_model, bias=False)   # up-project
+        self.proj = nn.Linear(4 * cfg.d_model, cfg.d_model, bias=False) # down-project
+        self.dropout = nn.Dropout(cfg.dropout)
+
+    def forward(self, x):
+        x = F.gelu(self.fc(x))
+        x = self.proj(x)
+        return self.dropout(x)
+</script>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>4. The block (pre-norm)</h2>
+        <p>
+          Two sublayers, each wrapped in a residual connection with the norm applied to the
+          <em>input</em> of the sublayer (<strong>pre-norm</strong>) — the clean identity path that lets
+          deep stacks train. See <a href="transformer-internals.html">Transformer Internals §1</a> for
+          why pre-norm beats post-norm.
+        </p>
+        <div class="code-view" data-file="model.py">
+<script type="text/x-python">
+class Block(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(cfg.d_model)
+        self.attn = CausalSelfAttention(cfg)
+        self.ln2 = nn.LayerNorm(cfg.d_model)
+        self.mlp = MLP(cfg)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))   # residual add around attention
+        x = x + self.mlp(self.ln2(x))    # residual add around MLP
+        return x
+</script>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. The full model</h2>
+        <p>
+          Token + learned positional embeddings, the stack of blocks, a final norm, and the language-model
+          head. Note <strong>weight tying</strong> (the embedding and unembedding share one matrix) and
+          the small-normal init. The <code>forward</code> returns logits and, if targets are given, the
+          cross-entropy loss — computed directly from logits for numerical stability
+          (<a href="numerics-precision.html">Numerics</a>).
+        </p>
+        <div class="code-view" data-file="model.py">
+<script type="text/x-python">
+class GPT(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)   # token -> vector
+        self.pos_emb = nn.Embedding(cfg.max_seqlen, cfg.d_model)   # position -> vector
+        self.drop = nn.Dropout(cfg.dropout)
+        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
+        self.ln_f = nn.LayerNorm(cfg.d_model)
+        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        self.tok_emb.weight = self.lm_head.weight    # weight tying (saves vocab*d_model params)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        batch, seqlen = idx.shape
+        assert seqlen <= self.cfg.max_seqlen
+        pos = torch.arange(seqlen, device=idx.device)
+        x = self.drop(self.tok_emb(idx) + self.pos_emb(pos))   # (batch, seqlen, d_model)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)                                # (batch, seqlen, vocab_size)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),   # (batch*seqlen, vocab)
+                targets.view(-1),                   # (batch*seqlen,)
+                ignore_index=-1,                    # -1 targets are skipped (padding)
+            )
+        return logits, loss
+</script>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Reading checklist</div>
+          <p>
+            You should be able to point at each line and say what it does: the fused QKV split, the
+            <code>view/transpose</code> to <code>(batch, n_heads, seqlen, head_dim)</code>, the <code>-inf</code> causal
+            mask before softmax, the <code>contiguous().view</code> to re-assemble heads, pre-norm
+            residuals, weight tying, and loss-from-logits. If any feels fuzzy, jump to the linked
+            concept page.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="csg-train">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Local exercise</span>
+            <span class="exercise-title">Run it on Shakespeare</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Copy these blocks into a file, add a character-level dataset (the tiny-shakespeare text), and
+            train for a few hundred steps with the loop from <a href="code-training-loop.html">The
+            Training Loop</a>. Confirm the loss drops from ~4.2 (ln of vocab size) toward ~1.5 and that
+            generation produces English-ish text. This single exercise cements the whole page.
+          </p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

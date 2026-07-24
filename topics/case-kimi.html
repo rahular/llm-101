@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Case Study: The Kimi Line · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="case-kimi">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Case studies</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 24 · Case studies</div>
+          <h1>Case Study: The Kimi Line (K2 → K2.5 → K2.7 → K3)</h1>
+          <p class="lead">
+            Moonshot's release series is the best public record of a frontier lab iterating: an
+            optimizer-stability breakthrough (K2), native multimodality + agent-swarm RL (K2.5), a
+            post-training-only product release (K2.7-Code), and a 2.8T hybrid-linear flagship (K3).
+            Four releases, four different <em>kinds</em> of improvement.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. K2 — MuonClip and the zero-spike run</h2>
+        <p>
+          K2 (1.04T total / 32B active MoE — 384 experts, 8 routed + 1 shared, 61 layers, MLA) was the
+          proof that <a href="optimizer-frontier.html">Muon</a> scales to a trillion parameters. The
+          enabling trick is <strong>MuonClip = Muon + QK-clip</strong>: Muon's token-efficiency plus a
+          per-head guard against its known failure mode, exploding attention logits. After each optimizer
+          step, any head whose max attention logit exceeds a threshold (τ=100) has its query and key
+          projection weights rescaled down — bounding logits <em>at the weights</em>, by construction,
+          rather than reacting to spikes after they happen
+          (<a href="training-dynamics.html">Training Dynamics §3</a>).
+        </p>
+        <p>
+          The headline claim, rare in its falsifiability: <strong>15.5T tokens pre-trained with zero
+          loss spikes</strong>. K2's post-training also set the "agentic" template — a large-scale
+          agentic data-synthesis pipeline (tool-use trajectories generated and filtered at scale —
+          <a href="synthetic-data.html">Synthetic Data</a>) plus joint RL over real and synthetic
+          environments.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>2. K2.5 — vision done by continued pretraining, and RL for agent swarms</h2>
+        <p>
+          K2.5 grafted vision onto K2 with findings worth quoting precisely:
+        </p>
+        <ul>
+          <li><strong>Early fusion at a low ratio beats late fusion at a high one.</strong> Continue
+            pretraining from a near-end K2 checkpoint on <strong>15T additional vision-text tokens</strong>
+            with only <strong>10–20% vision tokens</strong> throughout — rather than bolting on a
+            vision-heavy phase at the end. A data-mixture result, not an architecture one
+            (<a href="data-tokenization.html">Data §6</a>).</li>
+          <li><strong>MoonViT-3D</strong>: NaViT-style patch packing for native resolutions; video via 3D
+            spatiotemporal patches with 4× temporal compression, sharing all parameters with the image
+            path. Three stages: ViT alignment (to SigLIP) → 15T joint tokens at 4K → long-context
+            activation to 262K via YaRN.</li>
+          <li><strong>Decoupled Encoder Process (DEP)</strong>: the vision encoder's forward runs spread
+            across <em>all</em> GPUs (activations discarded), the backbone trains normally, and the
+            encoder recomputes for backward — sidestepping encoder load-imbalance to keep multimodal
+            training at <strong>~90% of text-only efficiency</strong>
+            (<a href="distributed.html">Distributed</a>-style thinking applied to modality balance).</li>
+        </ul>
+        <p>The post-training innovations travel even further:</p>
+        <ul>
+          <li><strong>Toggle</strong> — RL alternates between a budget-constrained phase (optimize under
+            a token cap) and a scaling phase, cutting output tokens <strong>25–30%</strong> at equal
+            quality. Token-efficiency as an explicit RL objective, not a prompt hack.</li>
+          <li><strong>Generative reward models</strong> (LLM judges that reason, then score) replacing
+            binary verifiers on agentic tasks where no checker exists
+            (<a href="rl-post-training.html">RL §3</a>).</li>
+          <li><strong>PARL (Parallel-Agent RL)</strong> — train an <em>orchestrator</em> over frozen
+            subagents. The reward has three parts: an instantiation incentive (anti
+            "serial collapse" — without it the orchestrator degenerates to doing everything itself,
+            sequentially), subagent finish rates, and task outcome — with a
+            <strong>critical-steps</strong> latency metric (main-agent steps + max over parallel
+            subagents, i.e. the DAG critical path). Result: 3–4.5× faster on WideSearch <em>and</em> F1
+            up 72.8→79.0.</li>
+        </ul>
+
+        <!-- ========================================================= -->
+        <h2>3. K2.7-Code — the post-training-only release</h2>
+        <p>
+          K2.7-Code changes <em>no architecture</em>: it's the K2.6 base with additional post-training
+          aimed at software engineering and agentic coding, released day-one with vLLM/SGLang support.
+          Reported: +21.8% on Kimi Code Bench v2 and <strong>~30% fewer thinking tokens</strong> than
+          K2.6 (the Toggle lineage). The strategic lesson: once the base is strong, an entire
+          product-defining release can come from post-training alone — capability and <em>cost</em>
+          both live there.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>4. K3 — the 2.8T hybrid flagship</h2>
+        <p>
+          K3 (July 2026; full report pending) is the largest open-weights model yet at
+          <strong>2.8T parameters</strong>, built on <strong>Kimi Delta Attention (KDA)</strong> — a
+          gated-DeltaNet-family hybrid linear attention (<a href="attention-variants.html">Attention
+          Variants §4</a>) — plus <strong>attention residuals</strong> (extra residual paths helping
+          information survive depth and long sequences), and <strong>"Stable LatentMoE"</strong>
+          activating <strong>16 of 896 experts</strong> (~1.8% expert activation). Moonshot claims
+          ~<strong>2.5× the scaling efficiency of K2</strong> — meaning the trajectory K2→K3 came as
+          much from optimizer + attention + sparsity engineering as from raw compute.
+        </p>
+
+        <div class="callout insight">
+          <div class="callout-title">The arc is the lesson</div>
+          <p>
+            The Kimi line is the perfect answer to "how do labs actually improve models?": K2 fixed
+            <em>optimization</em> (MuonClip, zero spikes), K2.5 fixed <em>modality and agency</em>
+            (early-fusion data mix, DEP systems trick, PARL/Toggle RL), K2.7 showed
+            <em>post-training-only</em> releases work, K3 scaled the <em>architecture</em> (hybrid
+            linear + extreme sparsity). Different layer of the stack each time — a reminder that model quality is an
+            every-layer property, not an architecture-only one.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) explain QK-clip mechanically (per-head, τ=100, rescales W_q/W_k post-step) and
+          why it's preventive not reactive; (2) quote the early-fusion-low-ratio finding and why it's a
+          data-mix result; (3) describe DEP and what imbalance it solves; (4) explain Toggle and PARL's
+          anti-serial-collapse reward + critical-steps metric; (5) place KDA and 16/896 LatentMoE in the
+          hybrid-attention and sparsity trends.</p>
+        </div>
+
+        <p class="footnote">
+          Sources: <a href="https://arxiv.org/abs/2507.20534">Kimi K2: Open Agentic Intelligence</a>;
+          <a href="https://arxiv.org/html/2602.02276v1">Kimi K2.5: Visual Agentic Intelligence</a>;
+          <a href="https://www.marktechpost.com/2026/06/12/moonshot-ai-releases-kimi-k2-7-code-a-coding-model-reporting-21-8-on-kimi-code-bench-v2-over-k2-6/">K2.7-Code
+          release notes</a>; <a href="https://kie.ai/blog/what-is-kimi-k3">Kimi K3 overview</a> (K3
+          technical report pending as of July 2026).
+        </p>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

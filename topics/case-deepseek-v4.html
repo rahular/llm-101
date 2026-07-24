@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Case Study: DeepSeek-V4 · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="case-deepseek-v4">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Case studies</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 22 · Case studies</div>
+          <h1>Case Study: DeepSeek-V4</h1>
+          <p class="lead">
+            The most technically dense open release of 2026: 1.6T-parameter MoE (49B active) trained on
+            ~33T tokens, with a hybrid compressed-attention design that makes <strong>1M-token
+            context</strong> tractable. Every section below is a transferable technique —
+            each maps back to a concept page on this site.
+          </p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">The two models</div>
+          <p>
+            <strong>V4-Pro</strong>: 1.6T total / 49B active, 33T tokens. <strong>V4-Flash</strong>:
+            284B / 13B active, 32T tokens. At 1M context, Pro runs at <strong>27% of the inference
+            FLOPs and 10% of the KV cache</strong> of DeepSeek-V3.2 (Flash: 10% / 7%), and KV storage is
+            ~<strong>2% of a bf16 GQA-8 baseline</strong>.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. Hybrid compressed attention: CSA + HCA</h2>
+        <p>
+          V4 interleaves two attention variants, both operating on <em>compressed</em> KV streams —
+          a third escape route from the KV-cache wall beyond the linear-hybrid (Qwen/Kimi) and
+          local/global (Inkling) families on <a href="attention-variants.html">Attention Variants</a>:
+        </p>
+        <ul>
+          <li><strong>CSA (Compressed Sparse Attention)</strong> — compress every <code>m</code> tokens
+            into one KV entry, then run <em>sparse</em> top-k selection over the compressed entries using
+            a low-rank <strong>"Lightning Indexer"</strong>, plus a sliding window of recent
+            <em>uncompressed</em> tokens for local fidelity.</li>
+          <li><strong>HCA (Heavily Compressed Attention)</strong> — compress much more aggressively
+            (<code>m′ ≫ m</code>) and attend <em>densely</em> over the small compressed stream. Cheap
+            global gist.</li>
+        </ul>
+        <p>
+          Both use shared-KV MQA with grouped output projections, partial RoPE (only the last 64 dims),
+          and an attention sink. The interleave gives you precise recent detail (window), selective
+          long-range recall (CSA top-k), and cheap global context (HCA) — without an uncompressed
+          <code>O(seqlen)</code> cache anywhere.
+        </p>
+
+        <div class="code-cell" data-id="dsv4-kv">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Why compression beats GQA alone at 1M context</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false"># KV entries held at seqlen=1M under each scheme (per layer, per head-group)
+seqlen = 1_000_000
+window, m, m_prime, topk = 4096, 16, 128, 2048
+
+full   = seqlen                          # vanilla / GQA: one entry per token
+csa    = window + seqlen // m            # window (uncompressed) + compressed stream
+hca    = seqlen // m_prime               # heavily compressed dense stream
+
+print(f"full attention : {full:>9,} KV entries")
+print(f"CSA            : {csa:>9,}  (window {window:,} + {seqlen//m:,} compressed; attends top-{topk})")
+print(f"HCA            : {hca:>9,}")
+print(f"\nCSA holds {100*csa/full:.1f}% and HCA {100*hca/full:.1f}% of the entries.")
+print("Add fp8/fp4 storage on top (vs bf16) and you reach V4's ~2%-of-baseline KV cache.")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. mHC: making a 1.6T model trainable</h2>
+        <p>
+          Hyper-connections generalize the residual stream (<a href="transformer-internals.html">Transformer
+          Internals §1</a>): instead of plain <code>x + f(x)</code>, layers mix multiple residual lanes
+          through a learned matrix. Unconstrained, that mixing matrix can amplify signals and destabilize
+          very deep/large models. V4's <strong>manifold-constrained hyper-connections (mHC)</strong>
+          project the mixing matrix onto the <em>doubly-stochastic</em> manifold (rows and columns sum
+          to 1, via ~20 Sinkhorn-Knopp iterations), guaranteeing spectral norm ≤ 1 — the residual mix can
+          redistribute signal but never blow it up. Cost: ~6.7% wall-time inside an overlapped pipeline
+          stage. The claim: without mHC, 1.6T + hybrid attention wouldn't train reliably.
+        </p>
+        <p class="footnote">
+          File this with the stability toolkit on <a href="training-dynamics.html">Training Dynamics §3</a>
+          — same family as QK-clip and z-loss: <em>bound the thing that can explode, by construction</em>.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>3. Anticipatory routing: MoE without the routing stall</h2>
+        <p>
+          MoE routing is a sequential bottleneck: you can't dispatch tokens (the all-to-all) until the
+          router has run. V4 <strong>decouples features from routes</strong> — expert <em>inputs</em> are
+          computed with current weights, but the routing <em>indices</em> come from a slightly older
+          router: a future batch is prefetched, routed early with the old router, and the decisions are
+          cached. By the time the batch trains, its routes are already known, so communication can be
+          scheduled ahead (<a href="distributed.html">Distributed §2–3</a>). A one-step-stale router
+          costs almost nothing in quality but unlocks full overlap.
+        </p>
+        <p>
+          Other MoE details worth quoting: fine-grained + shared experts (the DeepSeekMoE signature),
+          <strong>Sqrt(Softplus)</strong> replacing sigmoid for router affinities, <strong>hash
+          routing</strong> in the first layers (deterministic, learn-free load balance where features are
+          still generic), and <strong>FP4 expert weights</strong> via quantization-aware training.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>4. Muon, industrialized</h2>
+        <p>
+          The <a href="optimizer-frontier.html">Muon</a> recipe at 1.6T scale:
+        </p>
+        <ul>
+          <li><strong>Hybrid Newton–Schulz schedule</strong>: 8 steps of the tuned quintic
+            (3.4445, −4.7750, 2.0315) then 2 steps of (2, −1.5, 0.5) — a polish phase for a tighter
+            orthogonalization than the standard 5 steps.</li>
+          <li><strong>AdamW for the usual exceptions</strong> — embeddings, heads, RMSNorm gains, and
+            mHC's static components.</li>
+          <li><strong>Distributed plumbing</strong>: Muon needs the <em>full gradient matrix</em> per
+            weight, which conflicts with ZeRO's flat sharding — so a hybrid bucketing scheme keeps
+            Muon-owned matrices gatherable. MoE gradients are communicated in bf16 with
+            <strong>stochastic rounding</strong>, then summed locally in fp32.</li>
+        </ul>
+
+        <!-- ========================================================= -->
+        <h2>5. The precision ladder</h2>
+        <p>
+          V4 treats precision per-tensor-role, an aggressive extension of
+          <a href="numerics-precision.html">Numerics</a>: bf16 for the RoPE dims of K (position must
+          stay accurate), <strong>fp8 for the rest of the KV cache</strong>, <strong>fp4 for the
+          indexer</strong> path, and <strong>fp4 expert weights</strong> (QAT). The lesson to
+          articulate: precision is a <em>budget allocated by sensitivity</em>, not a global switch.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>6. Post-training: specialists → on-policy distillation</h2>
+        <p>
+          The pipeline is exactly the pattern from
+          <a href="on-policy-distillation.html">On-Policy Self-Distillation</a>, at production scale:
+          train independent <strong>domain specialists</strong> (math, coding, agent, instruction
+          following) via SFT → GRPO, then distill them all into one unified model with
+          <strong>full-vocabulary on-policy distillation (reverse KL)</strong>. Specialists can be pushed
+          hard without worrying about interference; OPD merges them without the forgetting that
+          sequential SFT would cause.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>7. Infrastructure notes that signal depth</h2>
+        <ul>
+          <li><strong>Batch-invariant, deterministic kernels</strong> — dual-kernel attention, DeepGEMM
+            over cuBLAS, deterministic reductions in sparse-attention/MoE backward. Run-to-run
+            reproducibility at scale (<a href="numerics-precision.html">Numerics §5</a> made real).</li>
+          <li><strong>Wave-based expert parallelism</strong> with fine-grained comm/compute overlap:
+            1.5–1.96× inference speedup.</li>
+          <li><strong>TileLang DSL</strong> with an SMT solver (Z3) for kernel integer analysis; host
+            codegen gets launch overhead under 1µs.</li>
+          <li><strong>Two-stage context parallelism</strong> for compressed attention: ranks exchange the
+            last <code>m</code> uncompressed KV entries, compress locally, then all-gather.</li>
+        </ul>
+
+        <div class="callout insight">
+          <div class="callout-title">The one-breath summary</div>
+          <p>
+            The V4 story in one breath: <em>"solve long context by compressing the KV stream twice over
+            (sparse-selective + heavy-dense), stabilize a 1.6T model by construction (doubly-stochastic
+            residual mixing, QAT), hide MoE routing latency by using slightly stale routes, and
+            post-train specialists then merge them by on-policy distillation."</em> Each clause is a
+            transferable principle, not a V4-specific fact.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) sketch CSA vs HCA and say why interleaving beats either alone; (2) explain what
+          doubly-stochastic residual mixing guarantees and why that matters at 1.6T; (3) explain
+          anticipatory routing as a latency-hiding trick and its staleness trade-off; (4) describe
+          per-role precision allocation (bf16 RoPE dims / fp8 KV / fp4 experts); (5) lay out the
+          specialists→OPD post-training pipeline and why it beats sequential SFT.</p>
+        </div>
+
+        <p class="footnote">
+          Sources: <a href="https://arxiv.org/html/2606.19348v1">DeepSeek-V4 technical report
+          (arXiv:2606.19348)</a>; <a
+          href="https://fireworks.ai/blog/what-deepseek-v4-says-about-training-platforms">Fireworks —
+          notes on V4's training system</a>.
+        </p>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

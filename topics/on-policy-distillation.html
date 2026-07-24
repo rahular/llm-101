@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>On-Policy Self-Distillation · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="on-policy-distillation">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Frontier</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 16 · Frontier</div>
+          <h1>On-Policy Self-Distillation</h1>
+          <p class="lead">
+            A 2025 sweet spot between distillation and RL: let the <em>student</em> generate the
+            sequences (on-policy), and have a teacher grade <em>every token</em> with a dense signal
+            (reverse KL). It fixes the exposure-bias brittleness of ordinary distillation while being
+            far cheaper than RL — and in the "self" case the teacher is the model's own stronger or
+            earlier self, which turns out to be a clean fix for capabilities lost during fine-tuning.
+          </p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">Where this sits</div>
+          <p>
+            This is the bridge between <a href="synthetic-data.html">Synthetic Data</a> (distillation)
+            and <a href="rl-post-training.html">RL for Post-training</a> (on-policy rollouts, KL to a
+            reference). The one-sentence positioning: <strong>on-policy sampling like RL, dense
+            per-token supervision like distillation.</strong>
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. The two-axis map: who samples, how dense the signal</h2>
+        <p>
+          Post-training methods differ on two axes — <strong>whose trajectories</strong> you train on,
+          and <strong>how dense</strong> the learning signal is. On-policy distillation picks the best
+          cell of the grid.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Method</th><th>Trajectories from</th><th>Signal</th><th>Weakness it has</th></tr></thead>
+            <tbody>
+              <tr><td>Off-policy distillation (SFT on teacher traces)</td><td>teacher</td><td>dense (per-token)</td><td>distribution mismatch / exposure bias</td></tr>
+              <tr><td>RL (PPO / GRPO)</td><td>student</td><td>sparse (one reward per sequence)</td><td>slow, high-variance credit assignment</td></tr>
+              <tr><td><strong>On-policy distillation</strong></td><td><strong>student</strong></td><td><strong>dense (per-token teacher KL)</strong></td><td>needs a teacher &amp; its logprobs</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. Why on-policy: exposure bias &amp; compounding errors</h2>
+        <p>
+          Ordinary distillation (and SFT) trains the student on <em>teacher-generated</em> transcripts —
+          always-correct paths the student may never actually visit at inference. The moment the student
+          makes its own mistake mid-sequence, it lands in a state the training data never covered, and
+          errors <strong>compound</strong>. Training on the student's <em>own</em> rollouts puts the
+          supervision exactly where the student actually goes, so it learns to recover from its own
+          mistakes. (Same argument as DAgger in imitation learning.)
+        </p>
+
+        <div class="code-cell" data-id="opd-exposure">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Compounding error: off-policy decays exponentially</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">eps = 0.02        # per-step chance the student deviates from the correct path
+seqlen = 300      # sequence length
+
+# off-policy: trained only on perfect traces -> once off-path, cannot recover
+p_off = (1 - eps) ** seqlen
+
+# on-policy: student visits off-path states in training, teacher shows the way back
+def p_on(eps, seqlen, r):
+    return ((1 - eps) + eps * r) ** seqlen      # survive if no error OR recovered (prob r)
+
+print(f"off-policy  P(stay correct over {seqlen} steps): {p_off:.3e}")
+for r in [0.0, 0.5, 0.9, 0.99]:
+    print(f"on-policy (recover prob {r:.2f}):           {p_on(eps, seqlen, r):.3e}")
+# r=0 reproduces off-policy. On-policy teaches recovery from the student's OWN mistakes.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. The signal: per-token reverse KL</h2>
+        <p>
+          On the student's rollout, the teacher scores each token by how much the student's next-token
+          distribution diverges from the teacher's. The loss is the <strong>per-token reverse KL</strong>
+          — reverse because the expectation is taken over the <em>student's</em> distribution:
+        </p>
+        <div class="formula">
+          per-token loss = KL( π_student(·|x₍₁..ₜ₎) ‖ π_teacher(·|x₍₁..ₜ₎) ) <br />
+          = Σᵥ π_student(v)·[ log π_student(v) − log π_teacher(v) ]
+        </div>
+        <p>
+          Two things make this powerful. First, it's <strong>dense</strong>: every token gets its own
+          gradient signal (~N bits of information per episode), versus RL's single scalar reward
+          (O(1) bit). Second, <strong>reverse</strong> KL is <em>mode-seeking</em> — it pushes the
+          student to concentrate mass on one high-probability teacher mode rather than smearing across
+          all of them, which is exactly what you want from a limited-capacity student.
+        </p>
+
+        <div class="code-cell" data-id="opd-dense">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Dense per-token signal vs RL's single scalar</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+import torch.nn.functional as F
+torch.manual_seed(0)
+
+vocab_size, seqlen = 6, 8
+student = F.softmax(torch.randn(seqlen, vocab_size), dim=-1)   # student next-token dist per position
+teacher = F.softmax(torch.randn(seqlen, vocab_size), dim=-1)   # teacher next-token dist per position
+
+# per-token reverse KL( student || teacher )
+per_tok = (student * (student.log() - teacher.log())).sum(dim=1)
+print("per-token reverse KL:", per_tok.round(decimals=3).tolist())
+print(f"-> {seqlen} supervision signals, one per token (dense)")
+print(f"RL would give ONE scalar for the whole {seqlen}-token sequence -> {per_tok.sum().item():.3f} total")
+print("dense feedback is why on-policy distillation needs far fewer steps than RL.")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <h3>Reverse vs forward KL — mode-seeking vs mode-covering</h3>
+        <p>
+          Worth being able to explain on a whiteboard. <strong>Forward</strong> KL(p‖q) (expectation over
+          the teacher <em>p</em>) is <em>mean-seeking</em>: <em>q</em> must put mass wherever <em>p</em>
+          does, so a limited <em>q</em> spreads to cover all modes (and hallucinates mass in between).
+          <strong>Reverse</strong> KL(q‖p) (expectation over the student <em>q</em>) is
+          <em>mode-seeking</em>: <em>q</em> is penalized for putting mass where <em>p</em> is low, so it
+          collapses onto a single mode. For distilling a big teacher into a smaller student, mode-seeking
+          is the right bias.
+        </p>
+
+        <div class="code-cell" data-id="opd-kl">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Fit a Gaussian to a bimodal target under each KL</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+x = torch.linspace(-8, 8, 400)
+def pmf(mu, s):
+    g = torch.exp(-0.5 * ((x - mu) / s) ** 2); return g / g.sum()
+
+# teacher p: bimodal (two well-separated modes)
+p = 0.5 * pmf(-3, 0.7) + 0.5 * pmf(3, 0.7); p = p / p.sum()
+
+def fwd_kl(q): return (p * ((p + 1e-12).log() - (q + 1e-12).log())).sum().item()   # KL(p||q)
+def rev_kl(q): return (q * ((q + 1e-12).log() - (p + 1e-12).log())).sum().item()   # KL(q||p)
+
+mus = torch.linspace(-4, 4, 41)
+sigs = torch.linspace(0.4, 4.0, 37)
+best_f = min((fwd_kl(pmf(m, s)), m.item(), s.item()) for m in mus for s in sigs)
+best_r = min((rev_kl(pmf(m, s)), m.item(), s.item()) for m in mus for s in sigs)
+print(f"forward KL  best q: mu={best_f[1]:+.1f}, sigma={best_f[2]:.1f}  -> WIDE, centered: covers both modes")
+print(f"reverse KL  best q: mu={best_r[1]:+.1f}, sigma={best_r[2]:.1f}  -> NARROW, on one mode: mode-seeking")
+print("on-policy distillation uses reverse KL -> student commits to a teacher mode.")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>4. The "self" in self-distillation</h2>
+        <p>
+          Self-distillation is on-policy distillation where the teacher is <em>the same model</em> — a
+          stronger version of itself. Common forms:
+        </p>
+        <ul>
+          <li><strong>Earlier checkpoint as teacher</strong> — recover a capability degraded by later
+            fine-tuning. This is the standout use case (below).</li>
+          <li><strong>"Thinking" mode teaching "non-thinking" mode</strong> — distill the model's own
+            chain-of-thought answers into its direct-answer mode (a technique used in the Qwen3 family) so
+            the fast mode inherits the reasoning mode's quality.</li>
+          <li><strong>Stronger sampling → cheaper policy</strong> — teacher = same model run with
+            best-of-N / more test-time compute; distill that improved behavior back into a single pass
+            (a self-improvement / "sharpening" loop).</li>
+          <li><strong>EMA / mean-teacher</strong> — teacher is an exponential moving average of the
+            student's own weights; the classic self-distillation stabilizer from SSL.</li>
+        </ul>
+
+        <div class="callout insight">
+          <div class="callout-title">The headline result — fixing catastrophic forgetting</div>
+          <p>
+            Thinking Machines' on-policy distillation study (2025): after mid-training a model on internal
+            documents, instruction-following collapsed from <strong>85% → 45%</strong> on IF-eval (it
+            learned the new knowledge but forgot how to follow instructions). On-policy distillation using
+            an <em>earlier checkpoint of the same model</em> as teacher recovered instruction-following to
+            <strong>83%</strong> <em>while keeping</em> the new knowledge (41% vs the pre-training 18%).
+            This makes self-distillation a promising tool for <strong>continual learning</strong>:
+            re-invoke lost behaviors without discarding new ones.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. Why it's cheap — RL's credit assignment without the sparsity</h2>
+        <p>
+          On-policy distillation is essentially RL where the reward is a <em>dense, per-token</em> teacher
+          signal instead of a sparse outcome reward. That density is the whole efficiency story: the model
+          learns which <em>specific tokens</em> were wrong, not just that the final answer was. Reported
+          numbers from the Thinking Machines study:
+        </p>
+        <ul>
+          <li>Reaches teacher-level performance in <strong>7–10× fewer gradient steps</strong> than RL,
+            with an estimated <strong>50–100× cumulative compute reduction</strong>.</li>
+          <li>AIME'24 math to ~70%: <strong>~1,800 GPU-hours</strong> via on-policy distillation vs
+            <strong>~17,920</strong> for the RL baseline (~9×), and ~30× vs extrapolated SFT once teacher
+            FLOPs are counted.</li>
+          <li>Smaller batch sizes suffice, because each episode carries far more information.</li>
+        </ul>
+        <p>
+          Contrast with <a href="rl-post-training.html">GRPO</a>: GRPO's group-relative advantage is a
+          clever <em>sparse</em> baseline; on-policy distillation sidesteps sparsity entirely by having a
+          teacher label every token. The trade-off: you need a teacher and access to its per-token
+          logprobs — you can't use it where no teacher exists (that's RLVR's domain).
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>6. The training loop</h2>
+        <ol>
+          <li><strong>Sample</strong> a batch of completions from the current student (on-policy).</li>
+          <li><strong>Score</strong> each token: run the teacher over the student's sequences to get its
+            per-token distribution (or just the logprob of the sampled token, for the sampled estimator).</li>
+          <li><strong>Compute</strong> per-token reverse KL as the loss/negative reward.</li>
+          <li><strong>Update</strong> the student to minimize it (a policy-gradient-style update, or a
+            direct supervised update toward the teacher distribution on the visited tokens).</li>
+          <li>Repeat — the student keeps sampling from its <em>improving</em> policy, so the distribution
+            it's trained on tracks where it actually is.</li>
+        </ol>
+        <div class="callout gotcha">
+          <div class="callout-title">⚠️ Practical wrinkles</div>
+          <p>
+            You need the teacher's logits over the student vocab (shared tokenizer, or a mapping). Fully
+            on-policy means re-sampling every step (expensive); many recipes use <em>near</em>-on-policy —
+            a small replay of recent student samples — to amortize generation. And like all distillation,
+            the student is bounded by the teacher on the distilled distribution (for self-distillation, by
+            the stronger self you're distilling from).
+          </p>
+        </div>
+
+        <div class="exercise" data-id="opd-loop">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Exercise</span>
+            <span class="exercise-title">On-policy vs off-policy on a toy sequence task</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Build a tiny character-level task with a "correct grammar" the teacher knows. Train a student
+            two ways: (a) off-policy — supervised on teacher sequences; (b) on-policy — student samples,
+            teacher scores per-token reverse KL. Inject a state the teacher sequences rarely visit and show
+            the off-policy student spirals there while the on-policy student recovers. This makes the
+            exposure-bias argument concrete.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="opd-selfdistill">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Local exercise</span>
+            <span class="exercise-title">Recover a "forgotten" capability by self-distillation</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            On your machine: take a small instruct model, fine-tune it hard on a narrow domain until an
+            instruction-following eval regresses (reproduce the forgetting). Then run on-policy
+            self-distillation with the <em>original</em> checkpoint as teacher (student samples on
+            instruction prompts, minimize per-token reverse KL to the original) and show the eval recovers
+            while the new-domain knowledge is retained. Reference: Thinking Machines, "On-Policy
+            Distillation" (2025); GKD (Agarwal et al., 2023).
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) place on-policy distillation on the who-samples × signal-density grid vs
+          off-policy distillation and RL; (2) explain exposure bias / compounding errors and why on-policy
+          rollouts fix them; (3) write the per-token reverse-KL objective and explain mode-seeking vs
+          mode-covering; (4) explain the "self" variants (earlier checkpoint, thinking→non-thinking, EMA)
+          and the catastrophic-forgetting recovery result; (5) explain why dense supervision makes it
+          ~7–10× cheaper than RL and where it can't be used (no teacher).</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

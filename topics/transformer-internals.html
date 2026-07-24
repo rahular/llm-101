@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Transformer Internals · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="transformer-internals">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Foundations</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 02 · Foundations</div>
+          <h1>Transformer Internals</h1>
+          <p class="lead">
+            The full decoder block, part by part. The goal: draw the data path from memory and
+            justify every modern choice (pre-norm, RMSNorm, SwiGLU, RoPE) against its alternative.
+            This page builds each component in PyTorch and assembles a working block.
+          </p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">Prerequisite</div>
+          <p>
+            Attention itself lives on its own page — see
+            <a href="attention.html">Attention: Scratch → Efficient</a>. Here we treat attention as a
+            component and focus on everything <em>around</em> it that makes a transformer block.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. The residual stream &amp; block structure</h2>
+        <p>
+          The cleanest mental model (from the interpretability literature): a transformer is a
+          <strong>residual stream</strong> — a running <code>(batch, seqlen, d_model)</code> activation that each
+          sublayer <em>reads from and writes back into</em> via addition. A block is two sublayers,
+          each wrapped in a residual connection:
+        </p>
+        <div class="formula">
+          x ← x + Attention(Norm(x)) <br />
+          x ← x + MLP(Norm(x))
+        </div>
+        <p>
+          Because every sublayer <em>adds</em> its output, information can flow untouched down the
+          whole depth (the residual is an identity path), and each layer only has to learn a
+          <em>delta</em>. This is what makes very deep stacks trainable.
+        </p>
+
+        <h3>Pre-norm vs post-norm</h3>
+        <p>
+          Where the normalization sits is one of the most consequential design choices, and a
+          near-guaranteed question.
+        </p>
+        <ul>
+          <li><strong>Post-norm</strong> (original Transformer): <code>x ← Norm(x + Sublayer(x))</code>.
+            The normalization is <em>on</em> the residual path, so the identity signal gets rescaled
+            every layer. Deep post-norm nets need careful LR warmup and often diverge without it.</li>
+          <li><strong>Pre-norm</strong> (GPT-2 onward, now standard):
+            <code>x ← x + Sublayer(Norm(x))</code>. The residual path is a clean identity; only the
+            sublayer <em>input</em> is normalized. Gradients flow directly through the residual, so
+            deep stacks train stably. The catch: the residual stream's variance grows with depth,
+            which is why a final norm before the output head is needed.</li>
+        </ul>
+
+        <div class="code-cell" data-id="ti-prenorm">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Pre-norm keeps the gradient path clean</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch, torch.nn as nn
+
+def stream_var(pre_norm, layers=60, d_model=128):
+    norm = nn.LayerNorm(d_model)
+    x = torch.randn(4, d_model)
+    with torch.no_grad():
+        for _ in range(layers):
+            W = torch.randn(d_model, d_model) * (1.0 / d_model) ** 0.5
+            sub = lambda z: torch.tanh(z @ W)
+            x = x + sub(norm(x)) if pre_norm else norm(x + sub(x))
+    return x.var().item()
+
+for label, pn in [("pre-norm", True), ("post-norm", False)]:
+    print(f"{label:10s}: final residual var = {stream_var(pn):8.2f}")
+# nn.LayerNorm replaces the hand-rolled norm; torch.no_grad() skips graph building.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. Normalization: LayerNorm vs RMSNorm</h2>
+        <p>
+          LayerNorm standardizes each token's feature vector to zero mean and unit variance, then
+          applies a learned scale <code>γ</code> and shift <code>β</code>. RMSNorm (now dominant —
+          Llama, most modern models) drops the mean-subtraction and the <code>β</code>: it just
+          divides by the root-mean-square. It's cheaper (no mean, one fewer stat, no bias) and works
+          as well or better, which is strong evidence the <em>re-centering</em> was doing little —
+          the useful part is the <em>re-scaling</em>.
+        </p>
+        <div class="formula">
+          LayerNorm: y = γ · (x − μ)/√(σ² + ε) + β <br />
+          RMSNorm:&nbsp;&nbsp; y = γ · x / √(mean(x²) + ε)
+        </div>
+
+        <div class="code-cell" data-id="ti-norm">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">LayerNorm & RMSNorm from scratch</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch, torch.nn as nn
+
+class RMSNorm(nn.Module):
+    def __init__(self, d, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d)); self.eps = eps
+    def forward(self, x):
+        return self.weight * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+x = torch.tensor([[2.0, -1.0, 0.5, 3.0]])
+ln = nn.LayerNorm(4)          # built-in: learned gamma (=1) and beta (=0)
+rn = RMSNorm(4)               # (torch>=2.4 also ships nn.RMSNorm)
+print("layernorm:", ln(x).detach().round(decimals=3), "mean~0:", round(ln(x).mean().item(), 6))
+print("rmsnorm  :", rn(x).detach().round(decimals=3))
+# nn.LayerNorm is a drop-in; RMSNorm is a ~3-line Module (no mean, no bias).</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+        <p class="footnote">
+          A related trick worth naming: <strong>QK-norm</strong> — normalizing queries and keys before
+          the attention dot-product — stabilizes attention logits and prevents the score blow-ups that
+          cause loss spikes (see <a href="training-dynamics.html">Training Dynamics</a>).
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>3. The MLP / feed-forward block</h2>
+        <p>
+          Each block's FFN is where most parameters live. Classic form: up-project to
+          <code>~4×D</code>, apply a nonlinearity, down-project back. Modern models use
+          <strong>SwiGLU</strong> — a gated variant that splits the up-projection into two branches,
+          gates one by the other's activation, and (to keep params matched) uses a hidden size of
+          <code>~⅔·4D = 8D/3</code>. SwiGLU consistently beats plain GeLU/ReLU FFNs at equal
+          parameters, which is why it's near-universal now.
+        </p>
+        <div class="formula">
+          GeLU FFN:&nbsp; W₂ · GeLU(W₁x) <br />
+          SwiGLU:&nbsp;&nbsp;&nbsp; W₂ · ( SiLU(W₁x) ⊙ (W₃x) )
+        </div>
+
+        <div class="code-cell" data-id="ti-swiglu">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">GeLU FFN vs SwiGLU (param-matched)</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch, torch.nn as nn, torch.nn.functional as F
+
+d_model = 512
+ffn = nn.Sequential(nn.Linear(d_model, 4 * d_model, bias=False), nn.GELU(),
+                    nn.Linear(4 * d_model, d_model, bias=False))
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, hidden):
+        super().__init__()
+        self.w1 = nn.Linear(d_model, hidden, bias=False)   # gate
+        self.w3 = nn.Linear(d_model, hidden, bias=False)   # value
+        self.w2 = nn.Linear(hidden, d_model, bias=False)   # down
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+glu = SwiGLU(d_model, int(8 * d_model / 3))
+n = lambda m: sum(p.numel() for p in m.parameters())
+print(f"plain FFN params: {n(ffn):,}")
+print(f"SwiGLU    params: {n(glu):,}  (~matched via 8·d_model/3)")
+print("output:", tuple(glu(torch.randn(2, d_model)).shape))</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>4. Positional information &amp; RoPE</h2>
+        <p>
+          Attention is permutation-invariant: shuffle the tokens and the raw attention math gives the
+          same set of outputs. Position must be injected explicitly. The evolution:
+        </p>
+        <ul>
+          <li><strong>Absolute</strong> (sinusoidal or learned): add a position embedding to the token
+            embedding. Simple, but doesn't extrapolate past trained lengths and bakes position into
+            the residual stream.</li>
+          <li><strong>ALiBi</strong>: add a distance-proportional bias to attention scores. Cheap,
+            extrapolates, but coarse.</li>
+          <li><strong>RoPE</strong> (Rotary Position Embedding — the modern default): <em>rotate</em>
+            each query/key vector by an angle proportional to its position. Its magic property: the
+            dot product between a rotated query at position <code>m</code> and a rotated key at
+            position <code>n</code> depends only on their <strong>relative</strong> distance
+            <code>m − n</code>, not absolute positions. So attention becomes naturally
+            relative-positional, and it extrapolates better than learned absolutes.</li>
+        </ul>
+
+        <div class="code-cell" data-id="ti-rope">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">RoPE from scratch — verify the relative-position property</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+def rope(x, pos, base=10000.0):
+    dim = x.shape[-1]
+    inv = base ** (-torch.arange(0, dim, 2).float() / dim)
+    ang = pos * inv
+    cos, sin = ang.cos(), ang.sin()
+    x1, x2 = x[0::2], x[1::2]
+    out = torch.empty_like(x)
+    out[0::2] = x1 * cos - x2 * sin
+    out[1::2] = x1 * sin + x2 * cos
+    return out
+
+torch.manual_seed(0)
+head_dim = 16
+q, k = torch.randn(head_dim), torch.randn(head_dim)
+a = rope(q, 5) @ rope(k, 3)      # dist 2
+b = rope(q, 100) @ rope(k, 98)   # dist 2, far away
+c = rope(q, 5) @ rope(k, 1)      # dist 4
+print(f"dist2 @(5,3): {a:.5f}   @(100,98): {b:.5f}   (equal -> relative)")
+print(f"dist4 @(5,1): {c:.5f}   (different)")
+# interleaved-pair rotation; the production form uses rotate_half (page 18).</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Why this matters</div>
+          <p>
+            If asked "why does RoPE extrapolate?" — the rotation encodes <em>relative</em> position, so
+            a model trained on short contexts has seen every small relative distance many times; long
+            context mostly needs those same relative patterns at unseen absolute positions. Follow-ups
+            probe context extension: <strong>NTK/position-interpolation</strong> tricks rescale the
+            RoPE frequencies (<code>base</code>) so trained models handle longer contexts without full
+            retraining. Knowing that lever exists reads as current.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. Embeddings, the output head, and parameter counting</h2>
+        <p>
+          The token embedding maps vocab → <code>D</code>; the unembedding (output head) maps
+          <code>D</code> → vocab for the final softmax. <strong>Weight tying</strong> shares one
+          matrix for both — saves <code>V×D</code> parameters and often helps quality. Being able to
+          count a model's parameters cold is a common warm-up and underpins all the memory/scaling
+          math on other pages.
+        </p>
+
+        <div class="code-cell" data-id="ti-params">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Count the parameters of a GPT-style model</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch, torch.nn as nn
+
+def param_count(vocab, d, layers, ffn_mult=4, tied=True):
+    attn = 4 * d * d
+    mlp = 2 * d * (ffn_mult * d)
+    per_layer = attn + mlp
+    embed = vocab * d
+    head = 0 if tied else vocab * d
+    return embed + layers * per_layer + head, layers * per_layer, embed
+
+for name, (V, d, L) in {"GPT-2 small": (50257, 768, 12), "~7B config": (32000, 4096, 32)}.items():
+    total, blocks, embed = param_count(V, d, L)
+    print(f"{name:12s}: total={total/1e6:8.1f}M (blocks={blocks/1e6:.1f}M, embed={embed/1e6:.1f}M)")
+
+# in real code you don't count by hand -- torch does it:
+emb = nn.Embedding(50257, 768)
+print("nn.Embedding(50257,768).weight.numel() =", emb.weight.numel())
+# for a whole model: sum(p.numel() for p in model.parameters())</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>6. Assembling a full block</h2>
+        <p>
+          Put it together: pre-norm, an attention sublayer, a residual add, pre-norm again, a SwiGLU
+          MLP, another residual add. Shape in = shape out, so blocks stack. (Attention is imported as
+          the component from its own page; here it's a placeholder to keep focus on the wiring.)
+        </p>
+
+        <div class="code-cell" data-id="ti-block">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">A full pre-norm transformer block</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch, torch.nn as nn, torch.nn.functional as F
+
+class Block(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.n1 = nn.LayerNorm(d_model)          # (nn.RMSNorm in torch>=2.4)
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.o = nn.Linear(d_model, d_model, bias=False)
+        self.n2 = nn.LayerNorm(d_model)
+        hidden = int(8 * d_model / 3)
+        self.w1 = nn.Linear(d_model, hidden, bias=False); self.w3 = nn.Linear(d_model, hidden, bias=False)
+        self.w2 = nn.Linear(hidden, d_model, bias=False); self.n_heads = n_heads
+
+    def attn(self, x):
+        batch, seqlen, d_model = x.shape
+        head_dim = d_model // self.n_heads
+        q, k, v = self.qkv(x).split(d_model, dim=-1)
+        split = lambda t: t.view(batch, seqlen, self.n_heads, head_dim).transpose(1, 2)
+        y = F.scaled_dot_product_attention(split(q), split(k), split(v), is_causal=True)  # fused + causal
+        return self.o(y.transpose(1, 2).reshape(batch, seqlen, d_model))
+
+    def forward(self, x):
+        x = x + self.attn(self.n1(x))
+        h = self.n2(x)
+        return x + self.w2(F.silu(self.w1(h)) * self.w3(h))
+
+torch.manual_seed(0)
+batch, seqlen, d_model, n_heads = 2, 8, 64, 4
+blk = Block(d_model, n_heads); x = torch.randn(batch, seqlen, d_model)
+for _ in range(6):
+    x = blk(x)
+print("after 6 blocks:", tuple(x.shape), "std:", round(x.std().item(), 3))
+# SDPA does causal masking for you; no manual -inf mask or softmax needed.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>7. Architectural variants: MoE</h2>
+        <p>
+          A Mixture-of-Experts layer replaces the single FFN with <code>E</code> expert FFNs plus a
+          <strong>router</strong> that sends each token to its top-<code>k</code> experts (usually
+          k=1 or 2). This decouples <em>total</em> parameters from <em>active</em> parameters per
+          token: you get a much larger model at nearly the FLOPs of a small one. The central problem
+          is <strong>load balancing</strong> — without pressure, the router collapses onto a few
+          experts. An <strong>auxiliary load-balance loss</strong> pushes token assignments to be even
+          across experts.
+        </p>
+        <div class="formula">
+          aux_loss = E · Σᵢ fᵢ · Pᵢ &nbsp;&nbsp; (fᵢ = fraction of tokens routed to expert i,
+          Pᵢ = mean router prob for expert i)
+        </div>
+
+        <div class="code-cell" data-id="ti-moe">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Top-1 routing + load-balance loss</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch, torch.nn as nn, torch.nn.functional as F
+torch.manual_seed(0)
+
+def lb_loss(probs, choice, n_experts):
+    f = torch.stack([(choice == i).float().mean() for i in range(n_experts)])  # dispatch fraction
+    P = probs.mean(0)                                                          # mean router prob
+    return (n_experts * (f * P).sum()).item(), f
+
+n_tokens, d_model, n_experts = 200, 32, 8
+x = torch.randn(n_tokens, d_model)
+router = nn.Linear(d_model, n_experts, bias=False)
+
+probs = F.softmax(router(x), dim=-1)
+choice = probs.argmax(-1)                    # top-1 expert per token
+loss, f = lb_loss(probs, choice, n_experts)
+print("dispatch:", f.round(decimals=2).tolist())
+print("aux_loss:", round(loss, 3))
+# probs.topk(k) selects top-k experts; scatter_add builds the load histogram (page 20).</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+        <p class="footnote">
+          Also know at a sentence's depth: <strong>GQA/MQA</strong> (shared KV heads — see
+          <a href="attention.html">Attention</a>) and <strong>state-space models</strong> (Mamba):
+          sequence mixing via a linear recurrence/selective scan instead of attention, giving
+          <code>O(T)</code> inference and no KV cache, at some cost to in-context recall.
+        </p>
+
+        <div class="exercise" data-id="ti-variant-ablation">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Exercise</span>
+            <span class="exercise-title">Design a Transformer-variant ablation</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            The classic architecture-research exercise. Pick one axis (RMSNorm vs LayerNorm, SwiGLU vs GeLU, RoPE
+            vs learned-absolute) and design the controlled experiment to compare them: what you hold
+            fixed (params, FLOPs, tokens, LR schedule), model/proxy size, which metrics, how many
+            seeds for noise, and how you'd decide the winner. Ties into
+            <a href="scaling-science.html">Scaling Laws &amp; Experiment Design</a>.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="ti-nanogpt">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Local exercise</span>
+            <span class="exercise-title">Build a modern block in PyTorch and train nanoGPT-scale</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            On your machine: implement a pre-norm block with RMSNorm + RoPE + SwiGLU in PyTorch, stack
+            it into a small GPT, and train on a toy corpus (Shakespeare/enwik8). Confirm loss drops and
+            generation is coherent. Then swap one component (e.g. RMSNorm→LayerNorm) and compare — a
+            hands-on version of the ablation above and the best way to make all of this reflexive.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) draw the residual-stream data path of a block from memory; (2) contrast
+          pre- vs post-norm and explain why pre-norm needs a final norm; (3) implement LayerNorm and
+          RMSNorm and say why re-centering is dispensable; (4) explain SwiGLU and the 8D/3 sizing;
+          (5) implement RoPE and prove the relative-position property; (6) count a model's parameters
+          and explain weight tying; (7) explain MoE routing + the load-balance loss and name
+          GQA/SSM alternatives.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Infra, K8s &amp; Dev Tooling · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="infra-tooling">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Systems</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 09 · Systems</div>
+          <h1>Infra, K8s &amp; Dev Tooling</h1>
+          <p class="lead">
+            The unglamorous glue that sets a team's velocity — on any serious training team, dev
+            tooling is half the job. Working depth on orchestration and checkpointing, plus real
+            opinions on reproducibility and iteration speed.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. Orchestration &amp; Kubernetes</h2>
+        <p>
+          A training job isn't one process — it's hundreds of ranks that must start together, discover
+          each other, and share high-speed networking. Kubernetes (or Slurm) is the layer that places
+          and babysits them. The concepts to hold:
+        </p>
+        <ul>
+          <li><strong>Pod</strong> — the unit of scheduling; for training, typically one pod per node
+            binding that node's 8 accelerators, with resource <em>requests/limits</em> declaring the
+            GPUs it needs.</li>
+          <li><strong>Job / indexed Job</strong> (or a training operator like Kubeflow's
+            <code>PyTorchJob</code>) — runs a fixed set of pods to completion, each with a rank index for
+            <code>torch.distributed</code> rendezvous.</li>
+          <li><strong>Gang scheduling</strong> — the critical one. A distributed job needs
+            <em>all</em> N pods running simultaneously; scheduling 60 of 64 leaves them idle (and
+            deadlocks the collective) while holding expensive GPUs. Gang scheduling (coscheduling
+            plugins, Volcano) enforces all-or-nothing placement.</li>
+          <li><strong>Taints / tolerations &amp; node pools</strong> — keep GPU nodes reserved for GPU
+            work; schedule to the right accelerator type and topology (same rack/spine for fast links).</li>
+          <li><strong>Restart policy</strong> — on a pod failure, the operator restarts the job (or the
+            failed rank in elastic mode), which reloads the last checkpoint — the recovery path from
+            <a href="accelerators.html">Accelerators</a>.</li>
+        </ul>
+        <div class="callout gotcha">
+          <div class="callout-title">⚠️ Why gang scheduling is non-negotiable</div>
+          <p>
+            Without it, two large jobs can each grab half the cluster, each wait forever for the other
+            half, and burn GPU-hours doing nothing — a classic distributed deadlock. Naming this failure
+            mode signals you've actually operated a cluster.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. Checkpointing &amp; state</h2>
+        <p>
+          Covered from the fault-tolerance angle in <a href="accelerators.html">Accelerators</a>; here
+          the focus is <em>correctness</em> of resumption. A resumable checkpoint must contain
+          <strong>everything that makes the run bit-reproducible from that point</strong>, not just the
+          weights:
+        </p>
+        <ul>
+          <li><strong>Model weights</strong> (sharded across ranks for large models).</li>
+          <li><strong>Optimizer state</strong> — Adam's <code>m</code> and <code>v</code>; forgetting
+            this restarts momentum and dents the loss curve.</li>
+          <li><strong>LR scheduler / step count</strong> — so the schedule continues, not restarts.</li>
+          <li><strong>RNG state</strong> (per rank) — dropout, data shuffling, init reproducibility.</li>
+          <li><strong>Dataloader position</strong> — which shard/offset, so you don't re-train on seen
+            data or skip unseen data.</li>
+        </ul>
+
+        <div class="code-cell" data-id="if-ckpt-overhead">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Checkpoint I/O overhead &amp; the case for async/sharded</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">def ckpt_seconds(params_b, n_ranks, write_gb_s_per_rank, sharded, async_):
+    state_gb = params_b * 16          # 16 bytes/param (weights+grads+Adam+master)
+    if sharded:
+        gb_per_writer = state_gb / n_ranks    # every rank writes its shard in parallel
+        eff_bw = write_gb_s_per_rank * n_ranks
+    else:
+        gb_per_writer = state_gb              # one rank writes everything
+        eff_bw = write_gb_s_per_rank
+    wall = state_gb / eff_bw
+    return 0.0 if async_ else wall            # async hides it behind compute
+
+N, ranks, bw = 70, 256, 1.0   # 70B model, 256 ranks, 1 GB/s/rank to storage
+for sharded in (False, True):
+    for asyn in (False, True):
+        t = ckpt_seconds(N, ranks, bw, sharded, asyn)
+        tag = f"sharded={sharded}, async={asyn}"
+        print(f"{tag:28s}: blocking time = {t:6.1f} s")
+# sharded turns a 20-min stall into seconds; async hides even that behind training.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. Experiment infrastructure</h2>
+        <p>
+          At any moment a research team is running dozens of experiments; the infra that keeps them
+          comparable and reproducible is a force multiplier (or, done badly, a constant tax).
+        </p>
+        <ul>
+          <li><strong>Tracking</strong> — log metrics, configs, code version, and artifacts per run
+            (W&amp;B, MLflow, or in-house). The non-negotiable: given a result, you can recover the
+            exact config and commit that produced it.</li>
+          <li><strong>Config management</strong> — one structured, version-controlled config per run
+            (Hydra/OmegaConf style), diffable against the baseline, so an ablation is literally a
+            one-line delta and nobody wonders "what was different?".</li>
+          <li><strong>Reproducibility</strong> — pinned dependencies/containers, seeded RNG, recorded
+            data version. Bit-for-bit repro is expensive (see determinism in
+            <a href="numerics-precision.html">Numerics</a>); statistical repro (same curve within seed
+            noise) is the usual bar.</li>
+          <li><strong>Launch &amp; monitor</strong> — one command from config to a scheduled multi-node
+            job, with dashboards and <em>automated alerting</em> on divergence (loss spike, NaN, throughput
+            drop) so a bad overnight run is caught in minutes, not at standup.</li>
+        </ul>
+
+        <!-- ========================================================= -->
+        <h2>4. Dev tooling &amp; iteration speed</h2>
+        <p>
+          The highest-leverage engineers are the ones who make the whole team faster. The mindset: find the friction
+          in the common loop and remove it. Concretely:
+        </p>
+        <ul>
+          <li><strong>Profiling</strong> — the PyTorch profiler / Nsight / XLA profiler to find the real
+            bottleneck (compute? comms? dataloader? launch overhead?) before optimizing. Optimizing the
+            wrong thing is the most common waste; measure first (roofline on
+            <a href="accelerators.html">Accelerators</a>).</li>
+          <li><strong>Fast inner loop</strong> — tiny-model / tiny-data "smoke" configs that exercise the
+            whole pipeline in minutes, so a code change is validated before a big launch. Catching a
+            shape bug in 2 minutes vs 2 hours of queue is the entire ROI of tooling.</li>
+          <li><strong>Shared abstractions</strong> — a clean internal training library so nobody
+            re-implements checkpointing, parallelism wiring, or logging per project (and per-project
+            bugs don't multiply).</li>
+          <li><strong>Regression guards</strong> — automated throughput/MFU and loss-curve checks in CI
+            so a "harmless" refactor that halves MFU or perturbs the loss is caught immediately.</li>
+        </ul>
+
+        <div class="callout insight">
+          <div class="callout-title">Why this matters</div>
+          <p>
+            Tooling questions are really "how do you think about leverage?" Strong answers name a
+            specific friction, quantify its cost (GPU-hours or engineer-hours), and propose the smallest
+            change that removes it — then mention how you'd measure that it actually helped. "I'd add a
+            5-minute smoke test that runs the full pipeline at toy scale, gated in CI, because most of
+            our failed launches are shape/config bugs that a full run only surfaces after an hour of
+            queue" is the shape of a great answer.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="if-resume">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Exercise</span>
+            <span class="exercise-title">What must a checkpoint contain to resume exactly?</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Enumerate every piece of state needed so that resuming from step <code>k</code> produces the
+            same trajectory as never having stopped (within seed noise). For each, say what goes wrong if
+            you omit it (e.g. drop optimizer state → momentum resets → visible loss bump; drop dataloader
+            position → data re-consumption or gaps). This exact question comes up constantly.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="if-tooling-pitch">
+          <div class="exercise-head">
+            <span class="exercise-badge">Reflect</span>
+            <span class="exercise-title">Pitch one dev-tooling improvement from your own experience</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            From your own work, articulate one concrete story: a friction in a team's training/eval
+            loop, roughly what it cost, the tool or abstraction you'd build (or built), and how you'd
+            measure the win. Being able to tell a specific, quantified story is the difference
+            between valuing good tooling and actually practicing it.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) explain pods/Jobs/gang-scheduling and why all-or-nothing placement matters;
+          (2) list everything a resumable checkpoint must contain and the failure of omitting each;
+          (3) reason about sharded/async checkpointing overhead; (4) describe the tracking + config +
+          repro + alerting stack that keeps experiments comparable; (5) articulate a leverage-minded
+          approach to dev tooling with a specific, quantified example.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KV-Cache Inference (code) · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="code-kv-cache">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Code</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 21 · Code</div>
+          <h1>KV-Cache Inference</h1>
+          <p class="lead">
+            The <a href="code-training-loop.html">generation loop</a> earlier re-runs the whole context
+            every step — correct but <code>O(T²)</code>. A KV cache stores the keys and values of past
+            tokens so each new step is <code>O(T)</code>. This page is the working code: the cache, a
+            cache-aware attention, and the two-phase <strong>prefill → decode</strong> loop, with a
+            PyTorch proof that cached decoding is bit-for-bit identical to full recompute.
+          </p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">The idea in one paragraph</div>
+          <p>
+            In attention, a token's <code>K</code> and <code>V</code> never change once computed — only
+            the <em>query</em> is new each step. So cache all past <code>K</code>/<code>V</code>, and at
+            each decode step compute just the new token's <code>q, k, v</code>, append <code>k, v</code>
+            to the cache, and attend the single query over the whole cache. The concept and the
+            cache-size formula are on <a href="attention.html">Attention §5</a>; here is the code.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. Prefill vs decode</h2>
+        <p>Generation has two phases with very different compute profiles:</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Phase</th><th>Input</th><th>Work</th><th>Bound by</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Prefill</strong></td><td>the whole prompt (T tokens) at once</td><td>fill the cache; parallel over T</td><td>compute (one big matmul)</td></tr>
+              <tr><td><strong>Decode</strong></td><td>one token at a time</td><td>append 1 K/V, attend over cache</td><td>memory bandwidth (read the cache)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          This split is why serving systems report prefill and decode throughput separately, and why the
+          KV cache (a memory-bandwidth problem) dominates decode latency and cost — the motivation for
+          GQA/MLA and paged attention below.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>2. The cache</h2>
+        <p>
+          Preallocate <code>K</code>/<code>V</code> tensors of shape
+          <code>(batch, n_kv_head, max_seq, head_dim)</code> and track how many positions are filled.
+          Preallocation avoids re-allocating every step (which would kill decode throughput).
+        </p>
+        <div class="code-view" data-file="kv_cache.py">
+<script type="text/x-python">
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class KVCache:
+    def __init__(self, batch, n_kv_heads, max_seqlen, head_dim, dtype, device):
+        shape = (batch, n_kv_heads, max_seqlen, head_dim)
+        self.k = torch.zeros(shape, dtype=dtype, device=device)   # preallocated
+        self.v = torch.zeros(shape, dtype=dtype, device=device)
+        self.length = 0                                           # filled positions
+
+    def append(self, k, v):
+        # k, v: (batch, n_kv_heads, new_len, head_dim). Write in place, then return the
+        # filled slice covering ALL positions so far (0 .. length).
+        new_len = k.size(2)
+        self.k[:, :, self.length:self.length + new_len] = k
+        self.v[:, :, self.length:self.length + new_len] = v
+        self.length += new_len
+        return self.k[:, :, :self.length], self.v[:, :, :self.length]
+</script>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. Cache-aware attention</h2>
+        <p>
+          Project the incoming tokens, apply RoPE at their <strong>absolute</strong> positions
+          (<code>start_pos</code>), append the new <code>k, v</code> to the cache, then attend. The one
+          subtlety is the causal mask: during <em>prefill</em> the query and key lengths match, so
+          <code>is_causal=True</code>; during <em>decode</em> the single query legitimately sees the
+          entire cache (all past), so no mask.
+        </p>
+        <div class="code-view" data-file="kv_cache.py">
+<script type="text/x-python">
+class CachedAttention(nn.Module):
+    # assumes apply_rope (page 18) and repeat_kv (page 20) are in scope
+    def __init__(self, d_model, n_heads, n_kv_heads):
+        super().__init__()
+        self.n_heads, self.n_kv_heads = n_heads, n_kv_heads
+        self.n_rep = n_heads // n_kv_heads
+        self.head_dim = d_model // n_heads
+        self.wq = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
+
+    def forward(self, x, cache, cos, sin, start_pos):
+        batch, seqlen, d_model = x.shape
+        q = self.wq(x).view(batch, seqlen, self.n_heads, self.head_dim).transpose(1, 2)     # (batch, n_heads, seqlen, head_dim)
+        k = self.wk(x).view(batch, seqlen, self.n_kv_heads, self.head_dim).transpose(1, 2)  # (batch, n_kv_heads, ...)
+        v = self.wv(x).view(batch, seqlen, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        # apply RoPE at ABSOLUTE positions BEFORE caching, so cached keys carry their position
+        cos_t, sin_t = cos[start_pos:start_pos + seqlen], sin[start_pos:start_pos + seqlen]
+        q, k = apply_rope(q, k, cos_t, sin_t)
+
+        k, v = cache.append(k, v)                # k, v now span positions 0 .. cache.length
+        k, v = repeat_kv(k, self.n_rep), repeat_kv(v, self.n_rep)   # GQA -> full heads
+
+        # prefill (seqlen>1): causal within the prompt. decode (seqlen==1): attend to all cached keys.
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=(seqlen > 1))
+        y = y.transpose(1, 2).contiguous().view(batch, seqlen, d_model)
+        return self.wo(y)
+</script>
+        </div>
+        <div class="callout gotcha">
+          <div class="callout-title">⚠️ Three things that silently break KV caches</div>
+          <p>
+            (1) <strong>RoPE position</strong> — apply it at the token's <em>absolute</em> position, not
+            0, or decoded tokens get the wrong rotation. (2) <strong>Chunked prefill</strong> — if you
+            prefill in chunks (T&gt;1 <em>with</em> a non-empty cache), <code>is_causal=True</code> is
+            wrong; you need an explicit mask offset by <code>cache.length − T</code>. (3)
+            <strong>Overflow</strong> — decoding past <code>max_seq</code> writes out of bounds; real
+            caches evict (sliding window) or grow.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>4. The generate loop: prefill then decode</h2>
+        <p>
+          Allocate one cache per layer, run the prompt once (prefill), then feed the model a single token
+          at a time (decode). The model threads <code>caches</code> and <code>start_pos</code> into each
+          layer's <code>CachedAttention</code>.
+        </p>
+        <div class="code-view" data-file="generate.py">
+<script type="text/x-python">
+@torch.no_grad()
+def generate(model, prompt_ids, max_new_tokens, temperature=1.0, top_k=None):
+    model.eval()
+    batch, prompt_len = prompt_ids.shape
+    dtype, device = model.dtype, prompt_ids.device
+    caches = [KVCache(batch, model.n_kv_heads, model.max_seqlen, model.head_dim, dtype, device)
+              for _ in range(model.n_layer)]
+
+    def sample(logits):
+        logits = logits / temperature
+        if top_k is not None:
+            v, _ = torch.topk(logits, top_k)
+            logits[logits < v[:, [-1]]] = float('-inf')
+        return torch.multinomial(F.softmax(logits, dim=-1), 1)
+
+    # --- PREFILL: process the whole prompt in one pass, filling every cache ---
+    logits = model(prompt_ids, caches, start_pos=0)      # (batch, prompt_len, vocab)
+    next_tok = sample(logits[:, -1, :])                   # first generated token
+    generated = [next_tok]
+
+    # --- DECODE: one token at a time; each step is O(cache_len), not O(seqlen^2) ---
+    for i in range(max_new_tokens - 1):
+        pos = prompt_len + i                              # absolute position of this token
+        logits = model(next_tok, caches, start_pos=pos)   # (batch, 1, vocab)
+        next_tok = sample(logits[:, -1, :])
+        generated.append(next_tok)
+
+    return torch.cat([prompt_ids] + generated, dim=1)
+</script>
+        </div>
+        <p class="footnote">
+          The model's <code>forward(idx, caches, start_pos)</code> is the
+          <a href="code-rope-modern.html">RoPE model</a> with each block taking
+          <code>(x, cache, cos, sin, start_pos)</code> and passing them to <code>CachedAttention</code>.
+          During decode <code>idx</code> is shape <code>(B, 1)</code>, so every matmul is tiny — the cost
+          is dominated by reading the growing cache.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>5. Verify it's identical to full recompute</h2>
+        <p>
+          A KV cache is an <em>optimization</em>: cached decoding must produce exactly what recomputing
+          the full prefix would. This cell proves it for single-head attention — process tokens one
+          at a time with a cache, and compare each step's output to recomputing attention over the whole
+          prefix from scratch.
+        </p>
+        <div class="code-cell" data-id="kvc-verify">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Cached decode == full recompute (PyTorch)</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+import torch.nn.functional as F
+torch.manual_seed(0)
+
+seqlen, head_dim = 6, 8
+Wq, Wk, Wv = (torch.randn(head_dim, head_dim) for _ in range(3))
+X = torch.randn(seqlen, head_dim)     # tokens that "arrive" one at a time
+
+def attn_full(Xp):
+    K, V = Xp @ Wk, Xp @ Wv
+    q = (Xp @ Wq)[-1]                       # only the newest query
+    return F.softmax((K @ q) / head_dim ** 0.5, dim=-1) @ V
+out_full = torch.stack([attn_full(X[:t + 1]) for t in range(seqlen)])
+
+Kc, Vc, out_cached = [], [], []
+for t in range(seqlen):
+    x = X[t]
+    Kc.append(x @ Wk); Vc.append(x @ Wv)    # append this token's key/value
+    q = x @ Wq
+    K, V = torch.stack(Kc), torch.stack(Vc)
+    out_cached.append(F.softmax((K @ q) / head_dim ** 0.5, dim=-1) @ V)
+out_cached = torch.stack(out_cached)
+
+print("max abs diff (cached vs full recompute):", (out_cached - out_full).abs().max().item())
+print("identical:", torch.allclose(out_cached, out_full))
+# ~0 -> the cache changes the COST, never the RESULT.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>6. Memory, and why paging exists</h2>
+        <p>
+          The cache is often the memory bottleneck at serving time. Its size (revisit the formula on
+          <a href="attention.html">Attention §5</a>):
+        </p>
+        <div class="formula">
+          bytes = 2 (K,V) × n_layer × n_kv_head × head_dim × seq × batch × dtype_bytes
+        </div>
+        <ul>
+          <li><strong>GQA / MLA</strong> shrink the <code>n_kv_head</code> (or the cached latent) term —
+            the single biggest lever on cache size (<a href="code-newer-arch.html">Newer Architectures</a>).</li>
+          <li><strong>Paged attention (vLLM)</strong> — instead of one contiguous
+            <code>max_seq</code> buffer per sequence (which wastes memory on padding and fragments), store
+            the cache in fixed-size <em>blocks</em> and keep a per-sequence block table, like OS virtual
+            memory. This lets many sequences of varying length share the pool with almost no waste and
+            enables prefix sharing.</li>
+          <li><strong>Sliding-window cache</strong> — for windowed attention, keep only the last
+            <code>window</code> positions and overwrite in a ring buffer, bounding the cache regardless of
+            sequence length.</li>
+        </ul>
+
+        <div class="callout insight">
+          <div class="callout-title">Why this matters</div>
+          <p>
+            Likely probes: "Why is decode memory-bound?" → each step reads the entire cache but does tiny
+            matmuls, so arithmetic intensity is low (<a href="accelerators.html">roofline</a>). "How do you
+            fit more concurrent users?" → shrink the cache (GQA/MLA), page it (vLLM), or quantize it.
+            "What's the cost of a KV cache?" → recite the formula and note it scales with batch × context,
+            which is why long-context serving is expensive.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="kvc-impl">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Local exercise</span>
+            <span class="exercise-title">Add the cache to your model and benchmark</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Wire <code>KVCache</code> + <code>CachedAttention</code> into the
+            <a href="code-rope-modern.html">RoPE model</a>, implement the prefill/decode
+            <code>generate</code>, and confirm it produces the same tokens as the naive recompute
+            <code>generate</code> at temperature 0. Then benchmark tokens/sec for both at 512-token
+            context — you should see a large speedup that grows with context length. Bonus: cap the cache
+            with a sliding window and observe constant per-step cost.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) explain prefill vs decode and why each is compute- vs memory-bound; (2) implement
+          a preallocated <code>KVCache</code> and a cache-aware attention; (3) get the causal masking right
+          in both phases and apply RoPE at absolute positions; (4) write the prefill→decode loop; (5) argue
+          that the cache changes cost not results; (6) explain the cache-size formula and the levers —
+          GQA/MLA, paged attention, sliding-window, quantization.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

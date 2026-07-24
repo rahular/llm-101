@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RoPE &amp; Modern Blocks (code) · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="code-rope-modern">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Code</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 18 · Code</div>
+          <h1>RoPE &amp; Modern Blocks</h1>
+          <p class="lead">
+            The upgrades that turn the <a href="code-standard-gpt.html">standard GPT</a> into a modern
+            Llama-style model: <strong>RMSNorm</strong> instead of LayerNorm, <strong>RoPE</strong>
+            instead of a learned position table, and a <strong>SwiGLU</strong> MLP. Concepts are on
+            <a href="transformer-internals.html">Transformer Internals</a>; here is the code.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. RMSNorm</h2>
+        <p>
+          Normalize by the root-mean-square over the feature dim — no mean subtraction, no bias. Cheaper
+          than LayerNorm and just as effective.
+        </p>
+        <div class="code-view" data-file="model.py">
+<script type="text/x-python">
+class RMSNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))   # learned per-channel gain
+
+    def forward(self, x):
+        # rsqrt(mean(x^2)) rescales each token to unit RMS; then apply the gain
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * rms * self.weight
+</script>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. RoPE — rotary position embeddings</h2>
+        <p>
+          RoPE injects position by <em>rotating</em> query/key vectors by an angle proportional to their
+          position, so the attention dot product depends only on the <strong>relative</strong> offset.
+          This is the <code>rotate_half</code> formulation (as in HuggingFace Llama): precompute
+          <code>cos</code>/<code>sin</code> once, then apply inside attention.
+        </p>
+        <div class="code-view" data-file="rope.py">
+<script type="text/x-python">
+def precompute_rope(head_dim, seqlen, base=10000.0, device=None):
+    # one inverse frequency per pair of dimensions
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    t = torch.arange(seqlen, device=device).float()
+    freqs = torch.outer(t, inv_freq)              # (seqlen, head_dim/2)
+    emb = torch.cat([freqs, freqs], dim=-1)       # (seqlen, head_dim)
+    return emb.cos(), emb.sin()                   # each (seqlen, head_dim)
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)                   # split the last dim in two halves
+    return torch.cat([-x2, x1], dim=-1)
+
+def apply_rope(q, k, cos, sin):
+    # q, k: (batch, n_heads, seqlen, head_dim); cos, sin: (seqlen, head_dim) -> broadcast
+    cos, sin = cos[None, None], sin[None, None]
+    q = q * cos + rotate_half(q) * sin
+    k = k * cos + rotate_half(k) * sin
+    return q, k
+</script>
+        </div>
+
+        <div class="code-cell" data-id="crm-rope">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Verify the relative-position property (PyTorch)</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+def rope(x, pos, base=10000.0):
+    dim = x.shape[-1]
+    inv = base ** (-torch.arange(0, dim, 2).float() / dim)   # dim/2 freqs
+    ang = pos * inv
+    cos = torch.cat([ang.cos(), ang.cos()])                  # (dim,) rotate_half layout
+    sin = torch.cat([ang.sin(), ang.sin()])
+    x1, x2 = x[:dim // 2], x[dim // 2:]
+    return x * cos + torch.cat([-x2, x1]) * sin
+
+torch.manual_seed(0)
+head_dim = 16
+q, k = torch.randn(head_dim), torch.randn(head_dim)
+a = (rope(q, 8) @ rope(k, 5)).item()      # offset 3
+b = (rope(q, 40) @ rope(k, 37)).item()    # offset 3, different absolute positions
+c = (rope(q, 8) @ rope(k, 2)).item()      # offset 6
+print(f"offset 3 @ (8,5)  : {a:.5f}")
+print(f"offset 3 @ (40,37): {b:.5f}   <- equal: score depends only on RELATIVE offset")
+print(f"offset 6 @ (8,2)  : {c:.5f}   <- different offset -> different score")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. SwiGLU MLP</h2>
+        <p>
+          A gated feed-forward: one branch gates the other via SiLU. Hidden size is set to
+          <code>~8·dim/3</code> so the three matrices roughly match a plain 4× FFN's parameter count
+          (<a href="transformer-internals.html">Transformer Internals §3</a>).
+        </p>
+        <div class="code-view" data-file="model.py">
+<script type="text/x-python">
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, hidden=None, multiple_of=256):
+        super().__init__()
+        hidden = hidden or int(8 * d_model / 3)             # ~2/3 of 4*d_model
+        hidden = multiple_of * ((hidden + multiple_of - 1) // multiple_of)  # round up
+        self.w1 = nn.Linear(d_model, hidden, bias=False)    # gate branch
+        self.w3 = nn.Linear(d_model, hidden, bias=False)    # value branch
+        self.w2 = nn.Linear(hidden, d_model, bias=False)    # down-projection
+
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))     # SiLU-gated
+</script>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>4. Attention with RoPE (via SDPA)</h2>
+        <p>
+          Separate Q/K/V projections, apply RoPE to Q and K after the head split, then call
+          <code>scaled_dot_product_attention</code> with <code>is_causal=True</code> — the fused
+          FlashAttention path. No mask buffer needed; SDPA builds the causal mask internally.
+        </p>
+        <div class="code-view" data-file="model.py">
+<script type="text/x-python">
+class Attention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.n_heads = cfg.n_heads
+        self.head_dim = cfg.d_model // cfg.n_heads
+        self.wq = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.wk = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.wv = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.wo = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+
+    def forward(self, x, cos, sin):
+        batch, seqlen, d_model = x.shape
+        q = self.wq(x).view(batch, seqlen, self.n_heads, self.head_dim).transpose(1, 2)   # (batch, n_heads, seqlen, head_dim)
+        k = self.wk(x).view(batch, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.wv(x).view(batch, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        q, k = apply_rope(q, k, cos, sin)                                 # inject position
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)       # fused + causal
+        y = y.transpose(1, 2).contiguous().view(batch, seqlen, d_model)
+        return self.wo(y)
+</script>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. The block, and wiring the model</h2>
+        <p>
+          Same pre-norm structure as the standard block, but with RMSNorm, RoPE attention, and SwiGLU.
+          Crucially there is <strong>no positional embedding table</strong> — position lives entirely in
+          RoPE, which the model precomputes once and threads through every block.
+        </p>
+        <div class="code-view" data-file="model.py">
+<script type="text/x-python">
+class Block(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.attn_norm = RMSNorm(cfg.d_model)
+        self.attn = Attention(cfg)
+        self.ffn_norm = RMSNorm(cfg.d_model)
+        self.mlp = SwiGLU(cfg.d_model)
+
+    def forward(self, x, cos, sin):
+        x = x + self.attn(self.attn_norm(x), cos, sin)
+        x = x + self.mlp(self.ffn_norm(x))
+        return x
+
+
+class LlamaModel(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)   # no pos_emb table!
+        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
+        self.norm = RMSNorm(cfg.d_model)
+        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        cos, sin = precompute_rope(cfg.d_model // cfg.n_heads, cfg.max_seqlen)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+
+    def forward(self, idx, targets=None):
+        batch, seqlen = idx.shape
+        x = self.tok_emb(idx)
+        cos, sin = self.cos[:seqlen], self.sin[:seqlen]  # crop RoPE tables to this length
+        for block in self.blocks:
+            x = block(x, cos, sin)
+        logits = self.lm_head(self.norm(x))
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
+</script>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Reading checklist</div>
+          <p>
+            Trace the differences from the standard GPT: RMSNorm (no mean/bias), RoPE applied to Q/K
+            inside attention (no learned position table), SwiGLU's three matrices with the 8·dim/3 hidden
+            size, and SDPA replacing the manual mask+softmax. These four swaps are essentially "GPT-2 →
+            Llama."
+          </p>
+        </div>
+
+        <div class="exercise" data-id="crm-swap">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Local exercise</span>
+            <span class="exercise-title">Ablate one component</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Take the model from this page and the training loop from
+            <a href="code-training-loop.html">The Training Loop</a>, and swap <em>one</em> component back
+            to the old version (RMSNorm→LayerNorm, or RoPE→learned positions, or SwiGLU→GELU-MLP). Train
+            both at matched compute on a small corpus and compare final loss. A hands-on version of the
+            "Transformer-variant ablation" from
+            <a href="transformer-internals.html">Transformer Internals</a>.
+          </p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

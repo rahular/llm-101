@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Python &amp; Tensor Fluency · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="python-pytorch">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Foundations</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 01 · Foundations</div>
+          <h1>Python &amp; Tensor Fluency</h1>
+          <p class="lead">
+            The foundation for everything else on this site: <em>thinking in tensors</em>. Shapes,
+            broadcasting, and vectorization should be reflex, not something you reconstruct.
+            Every cell here is real PyTorch — edit it and run it against the local kernel.
+          </p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">🧪 Runtime note</div>
+          <p>
+            Cells run <strong>real PyTorch</strong> on a local kernel — start it once with
+            <code>python3 kernel/server.py</code> and the status pill (bottom-right) turns green.
+            Edit any cell and hit <span class="kbd">⌘/Ctrl + Enter</span>. This page drills the
+            core reflexes: predicting output shapes, choosing
+            <code>transpose</code> vs <code>permute</code> and <code>view</code> vs
+            <code>reshape</code>, and — the big one — letting <code>autograd</code> compute the
+            backward pass you'd otherwise derive by hand.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. Shapes are the whole game</h2>
+        <p>
+          Ninety percent of live-coding bugs are shape bugs. Build the habit of narrating the
+          shape of every tensor. A transformer activation is conventionally
+          <code>(batch, seqlen, d_model)</code> — batch, sequence length, model dimension — and
+          attention adds a heads axis to get <code>(batch, n_heads, seqlen, head_dim)</code>. Train yourself to read an op and
+          predict the output shape before running it.
+        </p>
+
+        <div class="formula">
+          matmul rule: (…, m, k) @ (…, k, n) → (…, m, n). The leading "…" dims must
+          <em>broadcast</em>; the last two are the matrix dims.
+        </div>
+
+        <div class="code-cell" data-id="pp-shapes">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Predict, then run</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+batch, seqlen, d_model, n_heads = 2, 5, 16, 4
+head_dim = d_model // n_heads
+x = torch.randn(batch, seqlen, d_model)
+Wq = torch.randn(d_model, d_model)
+
+q = x @ Wq                                                # (batch, seqlen, d_model)
+# transpose swaps EXACTLY two axes; permute is the full-permutation version
+q = q.reshape(batch, seqlen, n_heads, head_dim).transpose(1, 2)   # (batch, n_heads, seqlen, head_dim)
+
+# -2,-1 index the last two dims regardless of rank
+scores = q @ q.transpose(-2, -1)                          # (batch, n_heads, seqlen, seqlen)
+
+for name, t in [("x", x), ("q", q), ("scores", scores)]:
+    print(f"{name:8s} {tuple(t.shape)}")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="callout gotcha">
+          <div class="callout-title">⚠️ Gotcha: transpose semantics differ</div>
+          <p>
+            <code>tensor.transpose(dim0, dim1)</code> swaps <em>exactly two</em> axes, while
+            <code>permute(*dims)</code> takes a <em>full permutation</em>. So the head-split above is
+            <code>x.reshape(batch,seqlen,n_heads,head_dim).transpose(1,2)</code>, equivalently
+            <code>.permute(0,2,1,3)</code>. Reaching for <code>transpose</code> when you meant
+            <code>permute</code> (or passing it three args) is a classic slip.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. Broadcasting</h2>
+        <p>
+          Broadcasting lets tensors of different shapes combine without explicit copies. The rule:
+          align shapes on the <strong>right</strong>; for each axis, sizes must be equal, or one of
+          them must be 1 (which is stretched). A missing leading axis is treated as 1.
+        </p>
+        <div class="formula">
+          (batch, 1, d_model) + (1, seqlen, d_model) → (batch, seqlen, d_model) <br />
+          (batch, seqlen, d_model) + (d_model,) → (batch, seqlen, d_model) <br />
+          (batch, seqlen, d_model) + (seqlen,) → <strong>error</strong> (seqlen ≠ d_model on the last axis)
+        </div>
+
+        <div class="code-cell" data-id="pp-broadcast">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Try it</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+x = torch.arange(6.).reshape(2, 3)      # (2,3)
+col = torch.tensor([10., 20.])          # (2,)  -- trailing axis is 2, NOT 3
+row = torch.tensor([1., 2., 3.])        # (3,)
+
+print("x + row =\n", x + row)           # (2,3)+(3,) -> broadcasts per column
+
+# add per ROW: unsqueeze to (2,1). col[:, None] == col.unsqueeze(1)
+print("\nx + col[:,None] =\n", x + col[:, None])
+
+try:
+    print(x + col)                      # (2,3)+(2,) -> error
+except RuntimeError as e:
+    print("\nRuntimeError:", str(e)[:60], "...")
+# a trailing-axis mismatch raises RuntimeError</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <p>
+          <code>None</code> (a.k.a. <code>tensor.unsqueeze(dim)</code>
+          in torch) inserts a size-1 axis. Deliberate <code>unsqueeze</code>/<code>[:, None]</code>
+          to control <em>which</em> axis broadcasts is one of the most useful reflexes to rebuild.
+        </p>
+
+        <div class="exercise" data-id="broadcast-bias">
+          <div class="exercise-head">
+            <span class="exercise-badge">Drill</span>
+            <span class="exercise-title">Add a per-head bias without a loop</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            You have <code>scores</code> of shape <code>(batch, n_heads, seqlen, seqlen)</code> and a bias
+            <code>b</code> of shape <code>(n_heads,)</code> (one scalar per head). Add the bias to every
+            score for that head, fully vectorized. Then do the same for a per-<em>query-position</em>
+            bias of shape <code>(T,)</code>.
+          </p>
+          <details class="solution">
+            <summary>Show solution</summary>
+            <p><code>scores + b[None, :, None, None]</code> for the per-head bias
+            (reshape <code>(n_heads,)</code> → <code>(1,n_heads,1,1)</code>). For the per-query-position bias,
+            it applies along the second-to-last axis: <code>scores + bpos[None, None, :, None]</code>.
+            The skill is picking exactly which axes get the size-1 slots.</p>
+          </details>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. einsum: the shape calculator you should love</h2>
+        <p>
+          <code>einsum</code> is the most expressive way to write tensor contractions, and being
+          fluent in it reads as senior. Repeated index letters are summed (contracted); letters on
+          the output side are kept. It subsumes matmul, batched matmul, transpose, sum, trace,
+          outer product, and diagonal extraction.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Operation</th><th>einsum</th></tr></thead>
+            <tbody>
+              <tr><td>Matrix multiply</td><td><code>"ik,kj->ij"</code></td></tr>
+              <tr><td>Batched matmul</td><td><code>"bik,bkj->bij"</code></td></tr>
+              <tr><td>Attention scores QKᵀ</td><td><code>"bhqd,bhkd->bhqk"</code></td></tr>
+              <tr><td>Weighted sum of values</td><td><code>"bhqk,bhkd->bhqd"</code></td></tr>
+              <tr><td>Row sum</td><td><code>"ij->i"</code></td></tr>
+              <tr><td>Trace</td><td><code>"ii->"</code></td></tr>
+              <tr><td>Outer product</td><td><code>"i,j->ij"</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="code-cell" data-id="pp-einsum">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">einsum == matmul, proven</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+
+batch, n_heads, seqlen, head_dim = 2, 3, 4, 5
+q = torch.randn(batch, n_heads, seqlen, head_dim)
+k = torch.randn(batch, n_heads, seqlen, head_dim)
+
+# einsum: repeated indices are summed (contracted); output indices are kept
+scores_einsum = torch.einsum("bhqd,bhkd->bhqk", q, k)
+scores_matmul = q @ k.transpose(-2, -1)
+
+print("shapes:", tuple(scores_einsum.shape), tuple(scores_matmul.shape))
+print("max abs diff:", (scores_einsum - scores_matmul).abs().max().item())</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>4. reshape vs view vs contiguous</h2>
+        <p>
+          A tensor is a flat buffer plus <em>strides</em> that say how far to step per axis.
+          <code>reshape</code>/<code>view</code> just reinterpret strides when possible — no data
+          moves. <code>transpose</code>/<code>permute</code> only rearrange strides, so the result
+          is <strong>non-contiguous</strong>: its memory order no longer matches its logical order.
+        </p>
+        <ul>
+          <li><code>view</code> requires contiguous memory and <em>errors</em> on a transposed
+            tensor; it only ever reinterprets strides, never copies.</li>
+          <li><code>reshape</code> copies if needed, so it "just works" — at the cost of a hidden
+            allocation. Hence the idiom <code>x.transpose(1,2).contiguous().view(...)</code>: the
+            <code>.contiguous()</code> forces a repacked copy so <code>view</code> is legal.</li>
+        </ul>
+
+        <div class="code-cell" data-id="pp-strides">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">See the strides move</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+x = torch.arange(12).reshape(3, 4)
+print("x   stride:", x.stride(), "contiguous:", x.is_contiguous())
+
+xt = x.t()                              # transpose = stride swap, no data copy
+print("xᵀ  stride:", xt.stride(), "contiguous:", xt.is_contiguous())
+
+# .view() REQUIRES contiguous memory -> it ERRORS on the transposed tensor
+try:
+    xt.view(-1)
+except RuntimeError as e:
+    print("xt.view(-1) ->", str(e)[:55], "...")
+
+# .reshape() inserts the copy when needed, so it "just works" (a hidden alloc)
+print("xt.reshape(-1):", xt.reshape(-1))
+# the idiom xt.contiguous().view(-1) forces the repack so view() is legal.
+# reshape() inserts the copy when needed, so it "just works" (a hidden alloc).</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Why this matters</div>
+          <p>
+            "Why does <code>.view()</code> throw after a <code>transpose</code>?" is a common warm-up.
+            Answer in terms of strides and memory contiguity, then mention that
+            <code>reshape</code> silently inserts the copy so it "just works" but can cost you a
+            hidden allocation in a hot loop.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. Fancy indexing &amp; gather</h2>
+        <p>
+          Selecting the logit of the correct token, gathering per-example choices, building a
+          causal mask — these are indexing problems. Know the difference between
+          <em>basic</em> slicing (views) and <em>advanced</em> indexing with integer arrays (copies,
+          broadcast together).
+        </p>
+
+        <div class="code-cell" data-id="pp-gather">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Gather the target logits</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(1)
+
+batch, vocab = 4, 10
+logits = torch.randn(batch, vocab)
+targets = torch.tensor([3, 7, 1, 0])
+
+# advanced (integer-array) indexing
+picked = logits[torch.arange(batch), targets]
+# the torch idiom: gather along dim 1 with the targets as indices
+picked2 = logits.gather(1, targets[:, None]).squeeze(1)
+
+print("indexing:", picked)
+print("gather  :", picked2)
+print("equal   :", torch.equal(picked, picked2))
+# F.cross_entropy does this gather internally to grab the target logit.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>6. Softmax &amp; cross-entropy from scratch</h2>
+        <p>
+          Everyone should implement these at least once, because two things only click by doing:
+          the <strong>max-subtraction trick</strong> for numerical stability, and that you compute
+          cross-entropy directly from logits via <code>log-softmax</code> (never
+          <code>log(softmax(x))</code>, which overflows/underflows). More on the numerics in
+          <a href="numerics-precision.html">Numerics &amp; Precision</a>.
+        </p>
+        <div class="formula">
+          softmax(x)ᵢ = e^{xᵢ − m} / Σⱼ e^{xⱼ − m}, &nbsp; m = max(x). <br />
+          logsumexp(x) = m + log Σⱼ e^{xⱼ − m}. <br />
+          CE = logsumexp(x) − x_target.
+        </div>
+
+        <div class="code-cell" data-id="pp-softmax">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Stable softmax + CE</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+import torch.nn.functional as F
+
+logits = torch.tensor([[2.0, 1.0, 0.1],
+                       [0.5, 2.5, 0.3]])
+targets = torch.tensor([0, 1])
+
+# library ops: numerically stable + fused. This is what you use in practice.
+probs = F.softmax(logits, dim=-1)
+loss = F.cross_entropy(logits, targets)   # = log_softmax + NLL, taken from LOGITS
+print("softmax row0:", probs[0], "sum", probs[0].sum().item())
+print("cross-entropy:", round(loss.item(), 4))
+
+sharp = torch.tensor([[10.0, 0.0, 0.0]])
+print("confident CE:", round(F.cross_entropy(sharp, torch.tensor([0])).item(), 6))
+# F.cross_entropy fuses log_softmax + NLL and is numerically stable.
+# NEVER do F.cross_entropy(F.softmax(x), y) -- always pass raw logits.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>7. The autograd mental model</h2>
+        <p>
+          The cell below runs real autograd, but you must also be able to explain <em>and</em>
+          hand-derive what it's doing. The model:
+        </p>
+        <ul>
+          <li>Every op on a tensor with <code>requires_grad=True</code> records a node in a
+            <strong>dynamic computation graph</strong> (built on the forward pass).</li>
+          <li><code>loss.backward()</code> walks that graph in reverse (reverse-mode autodiff),
+            applying the chain rule to accumulate <code>.grad</code> on each leaf tensor.</li>
+          <li>Gradients <strong>accumulate</strong> (add) into <code>.grad</code> — this is why you
+            call <code>optimizer.zero_grad()</code> each step, and also what makes gradient
+            accumulation over micro-batches free.</li>
+          <li><code>torch.no_grad()</code> / <code>detach()</code> stop graph tracking — used in
+            eval, inference, and when you deliberately cut the gradient (e.g. target networks,
+            straight-through estimators).</li>
+        </ul>
+
+        <p>
+          To prove you understand it, derive the backward of a linear layer by hand: for
+          <code>y = xW</code> with upstream gradient <code>g = ∂L/∂y</code>, you get
+          <code>∂L/∂x = gWᵀ</code> and <code>∂L/∂W = xᵀg</code>. The cell below builds a 2-layer
+          MLP, calls <code>loss.backward()</code>, and prints the gradients autograd produced —
+          which are exactly those hand-derived expressions.
+        </p>
+
+        <div class="code-cell" data-id="pp-manualgrad">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">autograd computes the backward pass</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+
+def relu(x): return x.clamp(min=0)
+
+x  = torch.randn(1, 4)
+W1 = torch.randn(4, 5, requires_grad=True)   # track gradients on these leaf tensors
+W2 = torch.randn(5, 1, requires_grad=True)
+
+loss = (relu(x @ W1) @ W2).sum()             # forward pass builds the graph
+loss.backward()                              # reverse-mode autodiff fills .grad
+
+print("dL/dW1 shape:", tuple(W1.grad.shape))
+print("dL/dW1[0,0]:", round(W1.grad[0, 0].item(), 6))
+print("dL/dW2[:,0]:", W2.grad[:, 0])
+# The chain rule by hand would be:
+#   gW2 = hᵀg,  gh = g W2ᵀ,  gz1 = gh · relu',  gW1 = xᵀ gz1.
+# autograd computes exactly those from the forward code alone -- you write no backward.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="exercise" data-id="softmax-backward">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Exercise</span>
+            <span class="exercise-title">Backprop through softmax + cross-entropy</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Show that for cross-entropy over a softmax, the gradient of the loss w.r.t. the logits
+            is simply <code>softmax(logits) − onehot(target)</code>. Implement it in PyTorch and
+            gradient-check it. This is <em>the</em> result to have memorized — it's why the output
+            layer's gradient is so clean and why it shows up in every training-loop derivation.
+          </p>
+          <details class="solution">
+            <summary>Hint / check</summary>
+            <p>
+              Let <code>p = softmax(z)</code>. Then <code>∂CE/∂zᵢ = pᵢ − 1[i = target]</code>.
+              Verify: <code>grad = softmax(z); grad[target] -= 1</code> should match the numerical
+              gradient of <code>logsumexp(z) − z[target]</code> to ~1e-5.
+            </p>
+          </details>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>8. Vectorize the loop away</h2>
+        <p>
+          The most common "make this faster" ask: someone hands you a Python loop over the batch
+          or sequence and asks you to vectorize it. The reflex — replace the loop with a
+          broadcast/matmul/einsum — is worth drilling until it's automatic.
+        </p>
+
+        <div class="exercise" data-id="pairwise-dist">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Drill</span>
+            <span class="exercise-title">Pairwise squared distances, no loops</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Given <code>A</code> of shape <code>(n, d)</code> and <code>B</code> of shape
+            <code>(m, d)</code>, produce <code>D</code> of shape <code>(n, m)</code> where
+            <code>D[i,j] = ||A[i] − B[j]||²</code>, without any Python loop. Then explain why the
+            <code>‖a‖² + ‖b‖² − 2aᵀb</code> expansion is preferred over the naive
+            <code>((A[:,None,:] - B[None,:,:])**2).sum(-1)</code> at scale.
+          </p>
+          <details class="solution">
+            <summary>Show solution</summary>
+            <div class="code-cell" data-id="pp-pairwise-sol">
+              <div class="code-cell-toolbar">
+                <span class="code-cell-label">Solution</span>
+                <span class="spacer"></span>
+                <button class="btn btn-run">▶ Run</button>
+                <button class="btn btn-reset">Reset</button>
+              </div>
+              <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+A = torch.randn(4, 3); B = torch.randn(5, 3)
+
+# expansion form
+sq = (A**2).sum(1)[:, None] + (B**2).sum(1)[None, :] - 2 * A @ B.T
+
+# torch ships the optimized primitive: torch.cdist (returns distance, not squared)
+ref = torch.cdist(A, B) ** 2
+
+print("shape:", tuple(sq.shape), "max diff vs cdist:", (sq - ref).abs().max().item())
+# torch.cdist IS the expansion, done in a fused kernel -- reach for it in real code.</textarea>
+              <pre class="code-out" hidden></pre>
+            </div>
+          </details>
+        </div>
+
+        <div class="exercise" data-id="torch-training-loop">
+          <div class="exercise-head">
+            <span class="exercise-badge">Local exercise</span>
+            <span class="exercise-title">Write a full PyTorch training step from memory</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            On your own machine (this needs real torch), write — without looking — a minimal
+            training loop for a linear model: forward, <code>F.cross_entropy</code>,
+            <code>zero_grad</code>, <code>backward</code>, <code>step</code>. Deliberately practice
+            the ordering (<code>zero_grad</code> before or after <code>step</code>? why does it not
+            matter as long as it's once per iteration?) and confirm the loss drops. This is the
+            canonical "blank editor" exercise — every training script grows from this skeleton.
+          </p>
+          <details class="solution">
+            <summary>Reference skeleton</summary>
+            <pre class="code-out" style="position:static;max-height:none">import torch, torch.nn as nn, torch.nn.functional as F
+
+model = nn.Linear(16, 10)
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+for step in range(100):
+    x = torch.randn(32, 16)
+    y = torch.randint(0, 10, (32,))
+    logits = model(x)                 # (32,10)
+    loss = F.cross_entropy(logits, y) # log-softmax + NLL, fused &amp; stable
+    opt.zero_grad(set_to_none=True)   # clear accumulated grads
+    loss.backward()                   # reverse-mode autodiff
+    opt.step()                        # W -= lr * m̂/(√v̂+eps)
+# zero_grad can go anywhere once per iter, as long as it's before the NEXT backward.</pre>
+          </details>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>Without hesitation, you can: (1) predict the output shape of any matmul/einsum;
+          (2) pick the right <code>None</code>/<code>unsqueeze</code> to make a broadcast work;
+          (3) write stable softmax + cross-entropy from logits; (4) explain strides,
+          contiguity, and why <code>view</code> fails after transpose; (5) hand-derive the linear
+          and softmax-CE backward passes; (6) turn a batch loop into one vectorized expression.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

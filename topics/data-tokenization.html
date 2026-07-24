@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data &amp; Tokenization · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="data-tokenization">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Data</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 10 · Data</div>
+          <h1>Data &amp; Tokenization</h1>
+          <p class="lead">
+            Data quality is the least-glamorous, highest-leverage lever in pre-training — recent
+            frontier reports repeatedly credit mixture and filtering choices over architecture
+            tweaks. This page covers the pipeline end to end, with runnable BPE, dedup, and
+            packing, plus the multilingual story most treatments skip.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. The pipeline</h2>
+        <p>
+          A pre-training data pipeline turns a raw crawl into packed token sequences. The stages,
+          roughly in order:
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Stage</th><th>What it does</th><th>Failure mode if skipped</th></tr></thead>
+            <tbody>
+              <tr><td>Extraction</td><td>HTML → text (e.g. trafilatura), language ID</td><td>Boilerplate, nav junk dominates</td></tr>
+              <tr><td>Dedup</td><td>Exact + near-dup removal (MinHash/LSH)</td><td>Memorization, wasted compute, eval leakage</td></tr>
+              <tr><td>Quality filtering</td><td>Heuristics + model-based classifiers</td><td>Garbage tokens dilute signal</td></tr>
+              <tr><td>Safety / PII</td><td>Toxicity, PII redaction</td><td>Harmful or private data memorized</td></tr>
+              <tr><td>Decontamination</td><td>Remove eval-set overlap</td><td>Inflated, meaningless benchmarks</td></tr>
+              <tr><td>Tokenization</td><td>Text → token IDs (BPE/SP)</td><td>—</td></tr>
+              <tr><td>Packing / sharding</td><td>Concatenate into fixed-length sequences</td><td>Padding waste, slow loaders</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout insight">
+          <div class="callout-title">Why this matters</div>
+          <p>
+            The signal here isn't reciting stages — it's judgment about <em>ordering and cost</em>.
+            Dedup before quality-filtering (cheaper to filter less data). Decontaminate against your
+            actual eval suite. Everything runs at petabyte scale, so each stage must be a streaming,
+            embarrassingly-parallel job (Spark/Beam/Ray over sharded files) — see
+            <a href="infra-tooling.html">Infra &amp; Tooling</a>.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. Tokenization: BPE from scratch</h2>
+        <p>
+          Byte-Pair Encoding starts from single characters/bytes and greedily merges the most
+          frequent adjacent pair into a new token, repeating until it reaches the target vocab size.
+          The learned <em>merge list</em> (ordered) is the tokenizer. Encoding a new string replays
+          the merges in order. Implementing the training loop from scratch is a clean, common ask.
+        </p>
+
+        <div class="code-cell" data-id="dt-bpe">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Train BPE merges on a toy corpus</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">from collections import Counter
+
+def get_pair_counts(seqs):
+    counts = Counter()
+    for seq, freq in seqs.items():
+        toks = seq.split()
+        for a, b in zip(toks, toks[1:]):
+            counts[(a, b)] += freq
+    return counts
+
+def merge(seqs, pair):
+    a, b = pair; merged = a + b
+    out = {}
+    for seq, freq in seqs.items():
+        out[seq.replace(f"{a} {b}", merged)] = freq
+    return out
+
+# corpus as word -> frequency; each word is space-separated chars + end marker
+corpus = {"l o w </w>": 5, "l o w e r </w>": 2,
+          "n e w e s t </w>": 6, "w i d e s t </w>": 3}
+
+merges = []
+for step in range(8):
+    pairs = get_pair_counts(corpus)
+    if not pairs: break
+    best = max(pairs, key=pairs.get)
+    merges.append(best)
+    corpus = merge(corpus, best)
+    print(f"merge {step+1}: {best[0]!r}+{best[1]!r} (count {pairs[best]})")
+
+print("\nfinal segmentations:")
+for seq in corpus: print(" ", seq)</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <p>Key refinements over this toy version, and why they matter:</p>
+        <ul>
+          <li><strong>Byte-level BPE</strong> (GPT-2 onward): operate on the 256 raw bytes, not
+            Unicode characters. Guarantees <em>zero</em> out-of-vocabulary — any string encodes —
+            and handles emoji, code, and every script uniformly. The cost: multi-byte characters
+            (most non-Latin scripts) take several tokens each.</li>
+          <li><strong>SentencePiece</strong> (BPE or unigram): trains directly on raw text with no
+            pre-tokenization, treats space as a normal symbol (▁), so it's language-agnostic — no
+            reliance on whitespace word boundaries. Standard for multilingual and non-space-delimited
+            languages.</li>
+          <li><strong>Pre-tokenization regex</strong>: splits on whitespace/punctuation before BPE so
+            merges don't cross word boundaries in unhelpful ways.</li>
+        </ul>
+
+        <div class="callout gotcha">
+          <div class="callout-title">⚠️ The multilingual tokenizer tax</div>
+          <p>
+            A vocab tuned on English fragments other scripts into many more tokens per word (poorer
+            "fertility"), so the same sentence costs more tokens → more compute, less effective
+            context, and worse quality for that language. If you work on non-English models this is
+            a first-order design decision: vocabulary allocation across languages, fertility
+            measurement, and the quality/compute trade-off of a larger multilingual vocab all
+            materially change what the model costs and how well it works.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="dt-vocab-size">
+          <div class="exercise-head">
+            <span class="exercise-badge">Discuss</span>
+            <span class="exercise-title">Vocab size trade-offs</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Be able to argue both directions: a <em>larger</em> vocab → shorter sequences (fewer
+            tokens per doc, so more text per context and cheaper attention) but a bigger embedding
+            /unembedding matrix and softmax, rarer tokens seen less often. A <em>smaller</em> vocab →
+            cheaper output layer but longer sequences. Where does the optimum sit, and how does it
+            shift for a multilingual model? What breaks if the vocab is 10× too large for your data?
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. Deduplication: MinHash + LSH</h2>
+        <p>
+          Near-duplicate documents cause memorization, waste compute, and leak eval data. Exact
+          dedup (hash the whole doc) misses near-dups. The standard scalable approach estimates
+          pairwise <strong>Jaccard similarity</strong> of shingle sets with <strong>MinHash</strong>,
+          then uses <strong>LSH</strong> to only compare likely-similar pairs instead of all N².
+        </p>
+        <div class="formula">
+          MinHash fact: P( minhash_h(A) == minhash_h(B) ) = Jaccard(A, B). <br />
+          Average agreement over k hashes → an unbiased Jaccard estimate.
+        </div>
+
+        <div class="code-cell" data-id="dt-minhash">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">MinHash estimates Jaccard</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+def shingles(text, k=3):
+    words = text.split()
+    return {" ".join(words[i:i+k]) for i in range(len(words) - k + 1)}
+
+def true_jaccard(a, b):
+    return len(a & b) / len(a | b)
+
+def minhash_sig(shs, seeds):
+    # for each seed, hash all shingles and take the min
+    return torch.tensor([min((hash((sh, s)) % (2 ** 32)) for sh in shs) for s in seeds])
+
+A = shingles("the quick brown fox jumps over the lazy dog today")
+B = shingles("the quick brown fox leaps over the lazy dog today")   # near-dup
+C = shingles("machine learning models are trained on large corpora")
+
+seeds = list(range(256))
+sigA, sigB, sigC = (minhash_sig(x, seeds) for x in (A, B, C))
+print(f"A vs B  true={true_jaccard(A,B):.3f}  minhash={(sigA==sigB).float().mean().item():.3f}")
+print(f"A vs C  true={true_jaccard(A,C):.3f}  minhash={(sigA==sigC).float().mean().item():.3f}")
+print("256 hashes -> the estimate tracks the true Jaccard closely.")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <p>
+          <strong>LSH</strong> makes this scale: split the signature into <code>b</code> bands of
+          <code>r</code> rows, hash each band, and only treat docs sharing a full band as candidates.
+          The band/row choice tunes the S-curve — the similarity threshold above which pairs are
+          almost always caught. This turns an O(N²) all-pairs comparison into near-linear.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>4. Quality filtering</h2>
+        <ul>
+          <li><strong>Heuristics</strong> (cheap first pass): length bounds, symbol/word ratios,
+            fraction of alphabetic chars, stopword presence, mean line length, repetition ratio.
+            Gopher and C4 rules are the canonical references.</li>
+          <li><strong>Model-based</strong>: a lightweight classifier scoring "is this like
+            high-quality reference text?" (the classic trick: positives = Wikipedia/books,
+            negatives = raw crawl). Modern pipelines increasingly use LLM-as-judge quality scores.</li>
+          <li><strong>Perplexity filtering</strong>: score docs with a small reference LM and cut the
+            extreme tails (both very high perplexity garbage and suspiciously low near-dups).</li>
+        </ul>
+        <div class="callout insight">
+          <div class="callout-title">Why this matters</div>
+          <p>
+            The mature take: quality filtering is a precision/recall trade-off you can overshoot —
+            too aggressive and you strip diversity and hurt the model. The frontier finding
+            (repeated across recent tech reports) is that <em>data quality and mixture often beat
+            raw scale</em>. Have an opinion on how you'd measure a filter's effect: small-scale
+            ablations with matched compute, not vibes.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. Sequence packing</h2>
+        <p>
+          Documents have wildly varying lengths. Padding each to the max wastes compute on pad
+          tokens. Packing concatenates tokenized documents (with a separator/EOS) and slices the
+          stream into fixed-length training sequences, so nearly every token is real. The subtlety:
+          a packed sequence contains multiple documents, so attention should not cross document
+          boundaries — hence document/attention masks (or accepting minor cross-contamination, which
+          many pipelines do for simplicity).
+        </p>
+
+        <div class="code-cell" data-id="dt-packing">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Pack variable-length docs, measure waste</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+
+EOS = 0
+doc_lens = torch.randint(5, 60, (40,))                      # 40 docs, varied lengths
+docs = [torch.randint(1, 100, (int(n),)).tolist() + [EOS] for n in doc_lens]
+SEQ = 64
+
+# padding approach: one doc per row, pad to SEQ
+pad_rows = len(docs)
+pad_tokens = pad_rows * SEQ
+real_tokens = sum(len(d) for d in docs)
+print(f"padding: {real_tokens}/{pad_tokens} real  -> {100*real_tokens/pad_tokens:.1f}% useful")
+
+# packing: concatenate everything, slice into SEQ chunks
+stream = [t for d in docs for t in d]
+n_full = len(stream) // SEQ
+print(f"packing: {n_full*SEQ}/{n_full*SEQ} real -> ~100% useful, {n_full} rows vs {pad_rows}")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>6. Data mixing &amp; curriculum</h2>
+        <p>
+          Pre-training data is a <em>mixture</em> of domains (web, code, books, math, multilingual,
+          Q&amp;A). The mixture weights are a first-class hyperparameter — often more impactful than
+          architecture tweaks. Key concepts:
+        </p>
+        <ul>
+          <li><strong>Domain weighting</strong>: upsample high-value, scarce domains (code, math);
+            downsample the near-infinite low-quality web. Methods range from hand-tuned to learned
+            (e.g. DoReMi optimizes weights with a small proxy model).</li>
+          <li><strong>Epoching</strong>: how many times to repeat scarce high-quality data before
+            repetition hurts. Repeating a few epochs is fine; heavy repetition causes memorization
+            and diminishing returns.</li>
+          <li><strong>Curriculum / annealing</strong>: many recipes shift the mixture over training —
+            e.g. a final "cooldown" phase on especially high-quality data (a widely reported trick).</li>
+        </ul>
+
+        <div class="exercise" data-id="dt-mixture">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Design</span>
+            <span class="exercise-title">Design a data-mixture ablation under fixed compute</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            You have a fixed token budget and want to choose between three candidate mixtures. Design
+            the experiment: proxy model size, how you hold compute constant, which evals, how you
+            control for eval noise, and how you'd extrapolate the small-scale result to the full run.
+            (Ties directly into <a href="scaling-science.html">Scaling Laws &amp; Experiment
+            Design</a>.)
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>7. Decontamination</h2>
+        <p>
+          If eval-set text leaks into training, your benchmarks are meaningless. Decontamination
+          removes (or flags) training documents overlapping with eval sets — typically via n-gram
+          overlap or the same MinHash machinery used for dedup. Points to raise: it must run against
+          <em>your actual eval suite</em>, overlap thresholds are a judgment call, and you should
+          report contamination rates rather than assume zero.
+        </p>
+
+        <div class="exercise" data-id="dt-dedup-impl">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Local exercise</span>
+            <span class="exercise-title">Build a MinHash-LSH near-dup finder</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            On your machine, extend the MinHash cell into a full pipeline: (1) shingle a few thousand
+            docs, (2) build MinHash signatures, (3) implement banded LSH to bucket candidates, (4)
+            verify candidates by true Jaccard above a threshold, (5) report how many O(N²)
+            comparisons LSH saved. This is a faithful miniature of a real dedup job and a great thing
+            to have actually written at least once.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) implement BPE training from scratch and explain byte-level vs
+          SentencePiece; (2) tell the multilingual tokenizer-fertility story with specifics;
+          (3) explain MinHash/LSH and why P(collision)=Jaccard; (4) list quality-filter families and
+          argue the over-filtering risk; (5) explain packing and its masking subtlety; (6) reason
+          about data mixture, epoching, and cooldown as tunable levers measured by ablation.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

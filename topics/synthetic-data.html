@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Synthetic Data · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="synthetic-data">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Frontier</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 14 · Frontier</div>
+          <h1>Synthetic Data</h1>
+          <p class="lead">
+            High-quality human text is running out, and synthetic data is now central to frontier
+            training — for capability injection, alignment, and reasoning. This page covers the
+            generation techniques (distillation, instruction synthesis, rejection sampling, self-
+            improvement) and the failure mode that governs all of them: <strong>model collapse</strong>.
+          </p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">Prerequisite</div>
+          <p>
+            Pairs with <a href="data-tokenization.html">Data &amp; Tokenization</a> (the pipeline for
+            <em>real</em> data) and <a href="rl-post-training.html">RL for Post-training</a> (which
+            consumes much of this data). The unifying tension: synthetic data lets you generate unlimited
+            targeted examples, but a generated distribution is only as good as the generator and the
+            filter — quality control <em>is</em> the technique.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. Why synthetic data</h2>
+        <ul>
+          <li><strong>The data wall.</strong> The stock of high-quality human text is finite and largely
+            already used; scaling laws want more tokens than exist. Synthetic data extends the supply.</li>
+          <li><strong>Targeted capability.</strong> You can generate exactly the distribution you're weak
+            on — math, code, tool use, a low-resource language, a reasoning format — instead of hoping the
+            web contains it.</li>
+          <li><strong>Cost &amp; control.</strong> Generation + automated filtering is far cheaper than
+            human labeling, and you control difficulty, style, and coverage.</li>
+          <li><strong>Verifiability.</strong> In domains with a checker (math answers, code tests), you can
+            generate <em>and validate</em> at scale — the highest-quality synthetic data there is.</li>
+        </ul>
+
+        <!-- ========================================================= -->
+        <h2>2. Distillation — the workhorse</h2>
+        <p>
+          The single most impactful technique: use a strong <strong>teacher</strong> model to generate
+          data for a smaller/cheaper <strong>student</strong>. This ranges from hard-label distillation
+          (train on the teacher's generated text) to <em>on-policy</em> distillation (student generates,
+          teacher scores/corrects) and sequence-level KD (match the teacher's output distribution). Most
+          open "instruct" models are, in part, distilled from a stronger model. The caveat is legal/ToS
+          and the fact that a student generally can't exceed its teacher on the distilled distribution.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>3. Instruction &amp; prompt synthesis</h2>
+        <p>
+          Bootstrapping instruction-tuning data from a model itself:
+        </p>
+        <ul>
+          <li><strong>Self-Instruct / Alpaca</strong> — seed with a few human instructions, have the model
+            generate many more (instruction, input, output) triples, filter, and fine-tune on them.</li>
+          <li><strong>Evol-Instruct (WizardLM)</strong> — <em>evolve</em> prompts to be harder and broader:
+            in-depth evolving (add constraints, deepen reasoning) and in-breadth evolving (new topics).</li>
+          <li><strong>Persona-driven (Persona-Hub)</strong> — condition generation on a huge set of
+            personas to get diversity at scale, mitigating the mode-collapse of "the model always writes
+            the same kind of example."</li>
+          <li><strong>CoT-Self-Instruct (2025)</strong> — the model reasons/plans via chain-of-thought
+            about a seed task <em>before</em> generating new examples, then a quality filter selects the
+            best — higher-quality prompts for both reasoning and non-reasoning tasks.</li>
+        </ul>
+
+        <!-- ========================================================= -->
+        <h2>4. Rejection sampling &amp; STaR (verifiable domains)</h2>
+        <p>
+          Where you can <em>check</em> an answer, generation quality skyrockets. <strong>Rejection
+          sampling</strong> (a.k.a. best-of-N + filter, or rejection-sampling fine-tuning / RFT): sample
+          many candidate solutions per problem, keep only the ones that pass the checker, and train on
+          those. <strong>STaR</strong> (Self-Taught Reasoner) closes the loop: generate rationales, keep
+          those that reach the correct answer, fine-tune, repeat — the model bootstraps its own reasoning
+          traces. This is a backbone of modern reasoning-model data pipelines.
+        </p>
+
+        <div class="code-cell" data-id="sd-rejection">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Rejection sampling lifts quality — quantified</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false"># model solves a given problem correctly with probability p (per attempt)
+def keep_rate_after_bestof(p, N):
+    return 1 - (1 - p) ** N        # P(at least one of N samples correct)
+
+for p in [0.1, 0.3, 0.5]:
+    print(f"base pass@1 = {p:.1f}")
+    for N in [1, 4, 16, 64]:
+        print(f"   best-of-{N:2d}: {keep_rate_after_bestof(p, N)*100:5.1f}% of problems get >=1 correct")
+    print()
+# training only on the VERIFIED-correct samples turns a weak solver into a
+# high-quality dataset -> why rejection sampling / STaR works so well.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. Rephrasing &amp; augmenting real data</h2>
+        <p>
+          Rather than generate from scratch, transform existing data:
+        </p>
+        <ul>
+          <li><strong>WRAP (rephrasing the web)</strong> — rewrite noisy web text into clean styles
+            (Wikipedia-like, Q&amp;A), improving quality and giving multiple views of the same content;
+            trains faster to a given loss.</li>
+          <li><strong>"Textbook-quality" (Phi series)</strong> — generate/curate textbook- and
+            exercise-like data; the thesis that small models trained on very high-quality (often
+            synthetic) data punch far above their size.</li>
+          <li><strong>Back-translation &amp; format conversion</strong> — turn documents into instructions,
+            code into explanations, etc., to manufacture task-shaped data from raw corpora.</li>
+        </ul>
+
+        <!-- ========================================================= -->
+        <h2>6. Self-improvement loops</h2>
+        <ul>
+          <li><strong>RLAIF / Constitutional AI</strong> — use an AI to provide the preference/critique
+            signal (against a written "constitution") instead of humans, then train on it. Scales
+            alignment feedback. (See <a href="rl-post-training.html">RL for Post-training</a>.)</li>
+          <li><strong>Self-rewarding / self-play</strong> — the model generates, judges, and improves on
+            its own outputs across rounds. Powerful, but the tightest possible loop and thus the most
+            exposed to the collapse risk below.</li>
+        </ul>
+
+        <!-- ========================================================= -->
+        <h2>7. The governing failure mode: model collapse</h2>
+        <p>
+          Train a model on its own (or another model's) outputs repeatedly, and the distribution
+          <strong>narrows</strong> — tails vanish, diversity drops, and errors compound generation over
+          generation. This <strong>model collapse</strong> is the central risk of synthetic data. The
+          intuition: sampling-then-refitting loses the rare events each round, so variance shrinks toward
+          the mean. The cell demonstrates it with a Gaussian refit loop.
+        </p>
+
+        <div class="code-cell" data-id="sd-collapse">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Model collapse: variance shrinks each generation</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+
+# each generation: sample from the current model, apply a QUALITY FILTER (drop the
+# atypical tails -- what real pipelines do), then REFIT the model to what survives.
+mu, sigma = 0.0, 1.0
+n = 500
+
+print(f"gen  0: sigma = {sigma:.3f}")
+for gen in range(1, 8):
+    s = mu + sigma * torch.randn(n)                    # generate
+    lo, hi = torch.quantile(s, torch.tensor([0.10, 0.90]))  # reject the "weird" 20%
+    s = s[(s >= lo) & (s <= hi)]
+    mu, sigma = s.mean().item(), s.std().item()        # refit to the filtered data
+    print(f"gen {gen:2d}: sigma = {sigma:.3f}")
+print("\neach round the filter trims the tails and the refit shrinks sigma ->")
+print("runaway diversity collapse. Anchoring with REAL data each round stops it.")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <p>The defenses, which double as the quality-control toolkit:</p>
+        <ul>
+          <li><strong>Anchor with real data</strong> — always mix a meaningful fraction of human data;
+            never train purely on model output round after round.</li>
+          <li><strong>Filter on three axes</strong> — complexity, quality, and diversity (the standard
+            framing). For non-verifiable data, methods like RIP score instructions by the reward-model
+            distribution of their sampled responses.</li>
+          <li><strong>Verify where possible</strong> — checker/execution feedback beats any learned filter.</li>
+          <li><strong>Measure diversity</strong> — track n-gram/embedding diversity and distribution
+            coverage, not just average quality, so you catch narrowing early.</li>
+          <li><strong>Decontaminate</strong> — synthetic data can leak eval content just like scraped data
+            (see <a href="data-tokenization.html">Data &amp; Tokenization</a>).</li>
+        </ul>
+
+        <div class="callout insight">
+          <div class="callout-title">Why this matters</div>
+          <p>
+            The mature take: synthetic data is not "free tokens" — it's a <em>generator + filter</em>
+            pipeline whose value is bounded by both. Strong answers name the domain split
+            (<em>verifiable</em> math/code, where rejection sampling is gold, vs <em>non-verifiable</em>
+            open text, where you rely on reward-model/LLM-judge filtering and diversity control), cite
+            model collapse as the reason you always anchor with real data, and treat "does this synthetic
+            set actually help?" as an ablation question (see
+            <a href="scaling-science.html">Scaling Laws</a>), not a foregone conclusion.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="sd-star">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Exercise</span>
+            <span class="exercise-title">Simulate a STaR loop</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Model a STaR iteration: a "solver" with per-problem success probability that improves as it
+            trains on its own verified-correct traces. Simulate several rounds — generate, keep only
+            correct, "train" (bump the success probability), repeat — and plot pass@1 over rounds. Then add
+            a difficulty distribution and show which problems the loop never solves (the frontier where you
+            need hints or a stronger teacher).
+          </p>
+        </div>
+
+        <div class="exercise" data-id="sd-collapse-fix">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Local exercise</span>
+            <span class="exercise-title">Break and fix model collapse</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Extend the collapse cell to a richer distribution (a mixture of Gaussians, or a small
+            char-level LM). Run the self-refit loop and quantify diversity loss (e.g. entropy, unique
+            n-grams, mode coverage) per generation. Then show that mixing in a fixed fraction of real
+            samples each round <em>stabilizes</em> the distribution. This is the empirical core of every
+            "will synthetic data hurt us?" discussion.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) motivate synthetic data (data wall, targeted capability, verifiability);
+          (2) explain distillation variants and their limits; (3) describe Self-Instruct / Evol-Instruct /
+          persona / CoT-Self-Instruct; (4) explain rejection sampling + STaR and why verifiable domains are
+          special; (5) name rephrasing/textbook-quality approaches; (6) explain model collapse, demonstrate
+          the variance shrink, and give the real-data-anchor + filter + diversity-metric defenses.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

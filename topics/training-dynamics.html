@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Training Dynamics &amp; Optimizers · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="training-dynamics">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Training science</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 04 · Training science</div>
+          <h1>Training Dynamics &amp; Optimizers</h1>
+          <p class="lead">
+            The machinery that turns a good architecture and good data into a converged model.
+            Expect the classic experiment-design probe: "the loss spiked at step 40k — what do you
+            do?" This page rebuilds the optimizers from scratch, the schedules, the stability
+            toolkit, and the batch-size story — each with a runnable cell.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. Optimizers, from SGD to AdamW</h2>
+        <p>
+          Build the ladder so you can derive AdamW rather than memorize it:
+        </p>
+        <ul>
+          <li><strong>SGD</strong>: <code>θ ← θ − lr·g</code>. Noisy, sensitive to LR and to the loss
+            landscape's conditioning.</li>
+          <li><strong>Momentum</strong>: accumulate a velocity <code>v ← β·v + g</code>, step with
+            <code>v</code>. Damps oscillation across steep directions, accelerates along shallow
+            ones.</li>
+          <li><strong>RMSProp</strong>: divide by a running RMS of gradients — a per-parameter
+            adaptive learning rate. Handles wildly different gradient scales across params.</li>
+          <li><strong>Adam</strong> = momentum + RMSProp with bias correction. First moment
+            <code>m</code> (mean), second moment <code>v</code> (uncentered variance), both
+            EMA-smoothed and bias-corrected for their zero init.</li>
+          <li><strong>AdamW</strong> = Adam with <em>decoupled</em> weight decay. The near-universal
+            choice for LLMs.</li>
+        </ul>
+        <div class="formula">
+          m ← β₁m + (1−β₁)g &nbsp;&nbsp; v ← β₂v + (1−β₂)g² <br />
+          m̂ = m/(1−β₁ᵗ) &nbsp; v̂ = v/(1−β₂ᵗ) &nbsp;&nbsp; θ ← θ − lr·m̂/(√v̂ + ε) − lr·λ·θ
+        </div>
+        <p>
+          That last term <code>− lr·λ·θ</code> is decoupled weight decay: applied
+          <em>directly to the weights</em>, not folded into <code>g</code>. Below, all four
+          optimizers minimize an ill-conditioned quadratic so you can watch adaptivity + momentum
+          earn their keep.
+        </p>
+
+        <div class="code-cell" data-id="td-optimizers">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Four optimizers on an ill-conditioned bowl</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+A = torch.tensor([100.0, 1.0])
+def loss_of(x): return 0.5 * (A * x**2).sum()
+
+def run(opt_cls, lr, steps=60, **kw):
+    x = torch.nn.Parameter(torch.tensor([1.0, 1.0]))
+    opt = opt_cls([x], lr=lr, **kw)
+    for _ in range(steps):
+        opt.zero_grad(); loss_of(x).backward(); opt.step()
+    return loss_of(x).item()
+
+print(f"SGD      final: {run(torch.optim.SGD, 0.01):.3e}")
+print(f"Momentum final: {run(torch.optim.SGD, 0.005, momentum=0.9):.3e}")
+print(f"Adam     final: {run(torch.optim.Adam, 0.1):.3e}")
+# you never write the update rule: torch.optim.{SGD,Adam,AdamW} do it, autograd the grads.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <h3>Why decoupled weight decay (the AdamW fix)</h3>
+        <p>
+          With plain Adam + L2 (adding <code>λθ</code> to the gradient), the decay term gets divided
+          by <code>√v̂</code> just like the gradient — so parameters with large gradient history get
+          <em>less</em> effective decay. That couples regularization to the adaptive scale, which
+          isn't what you want. AdamW applies decay directly to <code>θ</code>, so every parameter
+          decays at the same rate regardless of its gradient statistics. The cell shows the two
+          diverging.
+        </p>
+
+        <div class="code-cell" data-id="td-adamw">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">AdamW ≠ Adam + L2</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+# the two torch classes differ EXACTLY in coupled vs decoupled weight decay:
+#   torch.optim.Adam(weight_decay=)  -> L2, folded into the gradient (coupled)
+#   torch.optim.AdamW(weight_decay=) -> applied directly to weights (decoupled)
+def run(opt_cls, wd, steps=200):
+    x = torch.nn.Parameter(torch.tensor([1.0, 1.0]))
+    opt = opt_cls([x], lr=0.01, weight_decay=wd)
+    for _ in range(steps):
+        opt.zero_grad()
+        x.grad = torch.tensor([10.0, 0.1]) * x.sign()   # big vs tiny gradient
+        opt.step()
+    return x.detach().round(decimals=4)
+
+print("Adam (L2, coupled)  :", run(torch.optim.Adam, 0.1))
+print("AdamW (decoupled)   :", run(torch.optim.AdamW, 0.1))
+# torch ships both as separate classes; they differ only in coupled vs decoupled decay.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Why this matters</div>
+          <p>
+            Common openers: "Why AdamW over Adam?" (decoupled decay, above). "Why not plain SGD for
+            LLMs?" (Adam's per-parameter adaptivity handles the very different gradient scales across
+            embeddings/attention/FFN and is far more robust to LR). Know the typical settings:
+            <code>β₁=0.9, β₂=0.95</code> (LLMs often use 0.95, lower than the 0.999 default),
+            <code>ε=1e-8</code>, <code>wd≈0.1</code>. Newer optimizers (Lion — sign-based, cheaper
+            state; Shampoo/Muon — approximate second-order) come up as "what's new"; know the
+            one-line pitch of each.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. Learning-rate schedules</h2>
+        <p>
+          The LR schedule is nearly as important as the peak LR. The standard is
+          <strong>linear warmup then cosine decay</strong>. Warmup exists because Adam's second-moment
+          estimate <code>v̂</code> is unreliable in the first few hundred steps (tiny sample), so the
+          effective step size is erratic — ramping the LR up from 0 avoids early divergence. Cosine
+          then anneals smoothly toward a small final LR.
+        </p>
+        <p>
+          <strong>WSD</strong> (Warmup-Stable-Decay) is the increasingly popular alternative: warmup,
+          a long <em>constant</em> phase, then a short sharp decay. Its advantage is that you can
+          branch a decay from any point of the stable phase — decoupling the schedule from a fixed
+          total step count, which is great for continued/uncertain-length training.
+        </p>
+
+        <div class="code-cell" data-id="td-schedule">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Warmup + cosine vs WSD</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import math, torch
+
+opt = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))], lr=3e-4)
+warmup, total = 100, 1000
+
+def lr_lambda(step):                                   # returns a MULTIPLIER of base lr
+    if step < warmup:
+        return (step + 1) / warmup                     # linear warmup
+    r = (step - warmup) / (total - warmup)
+    return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * r))   # cosine to a 10% floor
+
+sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+for s in range(total):
+    opt.step(); sched.step()
+    if s in (0, 99, 100, 500, 999):
+        print(f"step {s:4d}: lr = {sched.get_last_lr()[0]:.2e}")
+# torch.optim.lr_scheduler.* wraps the optimizer; call sched.step() each iteration.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. Stability &amp; loss spikes</h2>
+        <p>
+          The single most-asked experiment-design scenario. A loss spike is a sudden jump in training
+          loss, sometimes recoverable, sometimes terminal. Build a mental decision tree of causes and
+          fixes:
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Likely cause</th><th>Signal</th><th>Fix</th></tr></thead>
+            <tbody>
+              <tr><td>LR too high / bad warmup</td><td>spike early or after LR peak</td><td>lower peak LR, longer warmup</td></tr>
+              <tr><td>A bad data batch</td><td>correlated with a specific batch/shard</td><td>skip batch, inspect/clean data</td></tr>
+              <tr><td>fp16 overflow</td><td>grad norm → inf/NaN, loss-scale thrashing</td><td>switch to bf16, loss scaling</td></tr>
+              <tr><td>Attention logit blow-up</td><td>huge attention scores, one layer diverges</td><td>QK-norm, z-loss, logit soft-cap</td></tr>
+              <tr><td>Gradient explosion</td><td>grad-norm spikes above clip threshold</td><td>gradient clipping (global norm)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <strong>Gradient clipping</strong> by global norm is the standard guardrail: compute the L2
+          norm of <em>all</em> gradients concatenated, and if it exceeds a threshold (commonly 1.0),
+          rescale every gradient by <code>threshold / norm</code>. This preserves direction while
+          capping step size — turning a would-be catastrophic step into a merely large one.
+        </p>
+
+        <div class="code-cell" data-id="td-clip">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Global-norm gradient clipping</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+# two parameters; the second has an exploding gradient
+p1 = torch.nn.Parameter(torch.zeros(100)); p1.grad = torch.randn(100) * 0.1
+p2 = torch.nn.Parameter(torch.zeros(100)); p2.grad = torch.randn(100) * 50.0
+
+# one call clips the GLOBAL norm across ALL params; it returns the PRE-clip norm
+before = torch.nn.utils.clip_grad_norm_([p1, p2], max_norm=1.0)
+after = (p1.grad.pow(2).sum() + p2.grad.pow(2).sum()).sqrt()
+print(f"grad norm before: {before:8.2f}")
+print(f"grad norm after : {after:8.4f}  (capped at 1.0, direction preserved)")
+# clip_grad_norm_ is the one line every training loop calls before opt.step().</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Answering "the loss spiked, what do you do?"</div>
+          <p>
+            Don't jump to a fix. The senior answer is a <em>diagnostic loop</em>: (1) check whether
+            it's recoverable — did loss come back down on its own? (2) correlate with the data — is it
+            a specific batch/shard? (3) look at grad norm and per-layer stats — overflow, one layer,
+            or global? (4) then apply the matched fix (skip batch, lower LR, clip, bf16, QK-norm), and
+            (5) if terminal, roll back to the last good checkpoint and resume past the bad data with
+            the mitigation in place. Mentioning checkpoint rollback + data quarantine is what
+            separates the experienced answer.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>4. Initialization &amp; signal propagation</h2>
+        <p>
+          Initialization controls whether activations (and gradients) grow or shrink as they pass
+          through layers. Too-large init → exploding activations; too-small → vanishing. The classic
+          fixes (Xavier/Glorot, Kaiming/He) scale the init variance by <code>1/fan_in</code> so
+          variance is preserved layer to layer. In deep transformers you also scale
+          <em>residual-branch</em> outputs by <code>1/√(2·n_layers)</code> (GPT-2 style) so the
+          residual stream doesn't accumulate unbounded variance with depth.
+        </p>
+
+        <div class="code-cell" data-id="td-init">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Init scale controls activation variance across depth</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch, torch.nn as nn
+
+def propagate(init_fn, layers=50, d=256):
+    x = torch.randn(1000, d)
+    for _ in range(layers):
+        W = torch.empty(d, d); init_fn(W)
+        x = torch.relu(x @ W)
+    return x.std().item()
+
+print("Kaiming (fan-in, relu):", f"{propagate(lambda W: nn.init.kaiming_normal_(W, nonlinearity='relu')):.3e}")
+print("too big (std 0.1)     :", f"{propagate(lambda W: nn.init.normal_(W, std=0.1)):.3e}")
+print("too small (std 0.01)  :", f"{propagate(lambda W: nn.init.normal_(W, std=0.01)):.3e}")
+# torch.nn.init.{kaiming_,xavier_,normal_} give the standard schemes;
+# model.apply(init_fn) initializes a whole network at once.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. Batch size, gradient accumulation, critical batch size</h2>
+        <p>
+          Larger batches give lower-variance gradient estimates and better hardware utilization, up
+          to a point. Two facts to hold:
+        </p>
+        <ul>
+          <li><strong>Gradient accumulation</strong> lets you simulate a large batch on limited
+            memory: run <code>k</code> micro-batches, sum (or average) their gradients, then step
+            once. The result is <em>identical</em> to one big batch (for a mean loss, average the
+            grads). The cell proves it.</li>
+          <li><strong>Critical batch size</strong> (McCandlish et al.): below it, doubling the batch
+            nearly halves the steps to a target loss (perfect scaling); above it, you get diminishing
+            returns — more batch buys little. It grows over training as gradients get noisier
+            relative to the signal. This sets the useful ceiling on DP width.</li>
+          <li>The <strong>LR ↔ batch-size</strong> relationship: when you scale batch, scale LR too —
+            linear scaling as a first approximation, square-root often better for Adam. Getting this
+            coupling right is a common follow-up.</li>
+        </ul>
+
+        <div class="code-cell" data-id="td-gradaccum">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Gradient accumulation == large batch</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+
+X = torch.randn(64, 8); y = torch.randn(64)
+w = torch.nn.Parameter(torch.randn(8))
+
+# full-batch gradient
+((X @ w - y)**2).mean().backward()
+full = w.grad.clone(); w.grad = None
+
+# accumulate over 4 micro-batches of 16 -- grads ADD across backward() calls automatically
+for i in range(0, 64, 16):
+    Xb, yb = X[i:i+16], y[i:i+16]
+    (((Xb @ w - yb)**2).mean() / 4).backward()      # /4 to average the micro-batch means
+
+print("max diff full vs accumulated:", (full - w.grad).abs().max().item())
+# torch grads accumulate by default -> "gradient accumulation" is just delaying zero_grad.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="exercise" data-id="td-lr-sweep">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Exercise</span>
+            <span class="exercise-title">LR ↔ batch-size scaling</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Extend the optimizer cell into a tiny training loop on a noisy convex problem. For batch
+            sizes {8, 32, 128}, find the LR that converges fastest, and check whether the best LR
+            scales linearly or with √batch. Relate your finding to why large-batch LLM training needs
+            LR warmup and careful peak-LR tuning.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="td-spike-repro">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Local exercise</span>
+            <span class="exercise-title">Induce and fix a loss spike in PyTorch</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            On your machine: train a small transformer on toy data, deliberately set the LR too high
+            (or inject one adversarial batch) to trigger a spike, and log the global grad norm. Then
+            add gradient clipping and/or lower the LR and show the spike is contained. Practice
+            narrating the diagnostic loop aloud as you go — that narration is what you're graded on.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) implement Adam/AdamW from scratch and explain every term incl. bias
+          correction; (2) explain why decoupled weight decay differs from L2 under Adam; (3) justify
+          warmup and describe cosine vs WSD; (4) run the loss-spike diagnostic loop and name the
+          matched fixes; (5) implement global-norm gradient clipping; (6) explain init's effect on
+          signal propagation; (7) prove gradient accumulation equals a large batch and explain
+          critical batch size and LR-batch coupling.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

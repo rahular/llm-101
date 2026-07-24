@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Interpretability &amp; Viz · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="interpretability">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Extras</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 11 · Extras</div>
+          <h1>Interpretability &amp; Viz</h1>
+          <p class="lead">
+            Interpretability is where "it works" turns into "we understand why" — and several
+            frontier labs treat it as a core research bet tied to safety. Building an interactive
+            visualization of model internals is also one of the best first projects in the area.
+            The cells here compute the quantities such a viz would display.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. Attention patterns</h2>
+        <p>
+          The most accessible window into a transformer: for a given head, the
+          <code>(T×T)</code> attention weight matrix shows which previous tokens each position reads
+          from. Distinct, interpretable patterns recur — <em>previous-token</em> heads (attend to
+          <code>t−1</code>), <em>positional</em> heads, and famously <em>induction</em> heads
+          (attend to the token that followed the last occurrence of the current token, implementing
+          in-context copying). A viz renders this matrix as a heatmap over the token strings.
+        </p>
+
+        <div class="code-cell" data-id="in-attnviz">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Render an attention matrix as a text heatmap</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+import torch.nn.functional as F
+torch.manual_seed(2)
+
+tokens = ["The", "cat", "sat", "on", "the", "mat"]
+seqlen = len(tokens); dim = 16
+X = torch.randn(seqlen, dim)
+q = X @ torch.randn(dim, dim); k = X @ torch.randn(dim, dim)
+scores = q @ k.T / dim ** 0.5
+scores = scores.masked_fill(torch.triu(torch.ones(seqlen, seqlen, dtype=torch.bool), 1), float('-inf'))
+W = F.softmax(scores, dim=-1)
+
+ramp = " .:-=+*#%@"
+print(" " * 6 + "".join(f"{t[:4]:>5}" for t in tokens))
+for i, t in enumerate(tokens):
+    cells = "".join(f"  {ramp[min(9, int(w * 9.99))]}  " for w in W[i].tolist())
+    print(f"{t[:5]:>5} {cells}")
+print("\ndarker = more attention; upper triangle is empty (causal mask).")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <p>
+          A useful scalar summary for a viz dashboard is <strong>attention entropy</strong> per head:
+          low entropy = sharp/focused (attends to one place), high entropy = diffuse (averages
+          broadly). Ranking heads by entropy is a quick way to surface the interesting ones.
+        </p>
+
+        <div class="code-cell" data-id="in-entropy">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Attention entropy: sharp vs diffuse heads</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch, math
+
+def row_entropy(W):
+    p = W.clamp(1e-12, 1)
+    return float(-(p * p.log()).sum(-1).mean())
+
+seqlen = 8
+sharp = torch.eye(seqlen) * 0.9 + 0.1 / seqlen
+sharp = sharp / sharp.sum(-1, keepdim=True)
+diffuse = torch.ones(seqlen, seqlen) / seqlen
+print(f"sharp head entropy   : {row_entropy(sharp):.3f}  (low -> focused)")
+print(f"diffuse head entropy : {row_entropy(diffuse):.3f}  (high -> averaging)")
+print(f"max possible (log seqlen): {math.log(seqlen):.3f}")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. The logit lens</h2>
+        <p>
+          A striking technique: apply the model's <em>final</em> unembedding (output head) to the
+          residual stream at <em>intermediate</em> layers, projecting the hidden state into vocabulary
+          space early. It reveals how the model's "current best guess" for the next token forms and
+          sharpens layer by layer — often the prediction is roughly right well before the final layer.
+          It's a one-liner given the weights, which is what makes it a great interactive-viz building
+          block.
+        </p>
+
+        <div class="code-cell" data-id="in-logitlens">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Logit lens: project hidden states to vocab</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+
+vocab = ["cat", "dog", "sat", "ran", "the", "mat"]
+vocab_size, dim = len(vocab), 16
+W_U = torch.randn(dim, vocab_size)    # unembedding (output head)
+target = torch.randn(dim)
+
+def logit_lens(h):
+    logits = h @ W_U
+    p = torch.softmax(logits, dim=-1)
+    top = int(logits.argmax())
+    return vocab[top], p[top].item()
+
+print("layer  top-token  confidence")
+for layer in range(6):
+    mix = layer / 5.0                 # more target signal in later layers
+    h = (1 - mix) * torch.randn(dim) + mix * (target + 0.3 * torch.randn(dim))
+    tok, conf = logit_lens(h)
+    print(f"  {layer}      {tok:>5}      {conf:.3f}")
+print("\nthe prediction crystallizes across depth -> what the logit lens visualizes.")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. Linear probes &amp; features</h2>
+        <p>
+          To test whether a concept is <em>linearly represented</em> in the activations, train a simple
+          linear classifier (a probe) on the hidden states to predict that concept. If a linear probe
+          succeeds, the information is present and linearly accessible. The cell trains a probe to
+          recover a planted concept direction from noisy activations.
+        </p>
+
+        <div class="code-cell" data-id="in-probe">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">A linear probe finds a planted concept direction</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+import torch.nn.functional as F
+torch.manual_seed(0)
+
+dim, n_samples = 32, 2000
+true_dir = torch.randn(dim); true_dir = true_dir / true_dir.norm()
+labels = (torch.rand(n_samples) > 0.5).float()
+acts = torch.randn(n_samples, dim) + (2 * labels - 1)[:, None] * true_dir * 1.5
+
+# train a real linear probe with autograd + an optimizer
+w = torch.zeros(dim, requires_grad=True); b = torch.zeros(1, requires_grad=True)
+opt = torch.optim.SGD([w, b], lr=0.5)
+for _ in range(300):
+    opt.zero_grad()
+    F.binary_cross_entropy_with_logits(acts @ w + b, labels).backward()
+    opt.step()
+
+pred = (acts @ w.detach() + b.detach()) > 0
+acc = (pred.float() == labels).float().mean().item()
+cos = abs(torch.dot(w.detach() / w.detach().norm(), true_dir).item())
+print(f"probe accuracy            : {acc:.3f}")
+print(f"|cos(probe, true concept)|: {cos:.3f}  (~1 -> recovered the direction)")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <p>
+          The frontier problem probes run into is <strong>superposition</strong>: models pack more
+          features than they have neurons, so a single neuron responds to many unrelated concepts
+          (polysemanticity). <strong>Sparse autoencoders (SAEs)</strong> address this by learning an
+          over-complete, sparse dictionary of activation directions, aiming to recover
+          <em>monosemantic</em> features — a major line of current interpretability research. Know the
+          one-paragraph version: SAE encodes activations into a wide, sparse hidden layer and
+          reconstructs them, so each sparse unit ideally corresponds to one human-interpretable feature.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>4. Building the visualization (the sample project)</h2>
+        <p>
+          If you set out to build an interactive internals visualizer, a strong design sketch:
+        </p>
+        <ul>
+          <li><strong>Capture</strong> — register forward hooks to grab attention weights and residual
+            activations per layer/head for a given input (no model changes, just taps).</li>
+          <li><strong>Interaction</strong> — hover a token to see what it attends to; a layer/head
+            selector; overlay the logit-lens top token per position per layer.</li>
+          <li><strong>Summaries</strong> — rank heads by entropy or by a pattern score (previous-token,
+            induction) so a user finds interesting heads without scrubbing all of them.</li>
+          <li><strong>What makes it useful vs decorative</strong> — it should answer a question ("why
+            did the model predict this token here?"), let you compare inputs, and scale to real models
+            (aggregate/sample, don't render 96×96 heads raw).</li>
+        </ul>
+
+        <div class="callout insight">
+          <div class="callout-title">The safety connection</div>
+          <p>
+            The safety community frames interpretability as an alignment lever: if we can read and eventually
+            <em>edit</em> what models represent, we can monitor for deception, detect dangerous
+            capabilities, and build trust that scales with capability. When motivation comes up, connect
+            your interest to this — being able to say <em>why</em> interpretability matters for safe
+            scaling, not just that it's neat, lands well here.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="in-viz-build">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Local exercise</span>
+            <span class="exercise-title">Build an attention visualizer on a real small model</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            On your machine: load a small pretrained model (GPT-2 small, or via
+            <code>transformer_lens</code>), extract attention weights with hooks for a sentence, and
+            render an interactive heatmap (matplotlib, or a tiny HTML/JS page). Bonus: find an induction
+            head by feeding a repeated random-token sequence and looking for the head that attends from
+            each token to the position after its previous occurrence. Having actually built this is a
+            genuine talking point.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="in-logitlens-real">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Local exercise</span>
+            <span class="exercise-title">Logit lens on a real model</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Apply the real unembedding to the residual stream at each layer of a small model for a
+            prompt with a clear continuation, and plot how the top predicted token and its probability
+            evolve with depth. Confirm the prediction often forms before the final layers — then explain
+            what that implies about where computation happens in the network.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) explain attention-pattern types (previous-token, positional, induction) and
+          compute/visualize a head's weights and entropy; (2) describe the logit lens and what it
+          reveals about depth; (3) explain linear probes and what a successful probe does and doesn't
+          prove; (4) give the one-paragraph story of superposition and SAEs; (5) design a useful (not
+          decorative) internals visualization; (6) connect interpretability to AI safety.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

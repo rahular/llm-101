@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Numerics &amp; Precision · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="numerics-precision">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Training science</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 05 · Training science</div>
+          <h1>Numerics &amp; Precision</h1>
+          <p class="lead">
+            Low precision isn't optional at scale — but it's where silent NaNs and stalled training
+            hide. What separates confident practitioners is precise reasoning about <em>range vs precision</em>, the
+            mixed-precision recipe, and the stable formulations. Every claim here is backed by a
+            runnable cell you can poke at.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. The formats: range vs precision</h2>
+        <p>
+          A float is <code>sign · mantissa · 2^exponent</code>. The <strong>exponent</strong> bits set
+          the dynamic <em>range</em>; the <strong>mantissa</strong> bits set the <em>precision</em>.
+          This single trade-off explains every format choice in training.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Format</th><th>Exp / Mantissa</th><th>Max value</th><th>~Decimal digits</th><th>Use</th></tr></thead>
+            <tbody>
+              <tr><td>fp32</td><td>8 / 23</td><td>~3.4e38</td><td>~7</td><td>master weights, reductions</td></tr>
+              <tr><td>tf32</td><td>8 / 10</td><td>~3.4e38</td><td>~3</td><td>matmul on tensor cores</td></tr>
+              <tr><td>fp16</td><td>5 / 10</td><td><strong>65504</strong></td><td>~3</td><td>legacy mixed precision (needs loss scaling)</td></tr>
+              <tr><td>bf16</td><td>8 / 7</td><td>~3.4e38</td><td>~2</td><td>the modern default for training</td></tr>
+              <tr><td>fp8 (e4m3/e5m2)</td><td>4/3 or 5/2</td><td>~448 / ~57344</td><td>~1</td><td>H100+ compute, frontier</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          The headline: <strong>bf16 keeps fp32's exponent</strong> (same huge range) and sacrifices
+          mantissa. fp16 has more mantissa (more precise) but a tiny range that overflows at 65504.
+          For training — where gradients and activations span many orders of magnitude — <em>range
+          matters more than precision</em>, so bf16 wins and usually needs no loss scaling.
+        </p>
+
+        <div class="code-cell" data-id="np-formats">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">fp16 overflows; bf16 doesn't</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+# torch has bf16 and fp16 as REAL dtypes -- no bit-hacking needed
+big = 70000.0
+print("fp16(70000):", torch.tensor(big, dtype=torch.float16))   # -> inf (max 65504)
+print("bf16(70000):", torch.tensor(big, dtype=torch.bfloat16))  # fine (fp32 exponent range)
+
+print("\nrepresenting 1.001:")
+print("  fp16:", torch.tensor(1.001, dtype=torch.float16).item())
+print("  bf16:", torch.tensor(1.001, dtype=torch.bfloat16).item())
+# torch.bfloat16 is a native dtype -- no bit-hacking needed to represent it.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. Mixed precision &amp; master weights</h2>
+        <p>
+          Mixed precision keeps a <strong>fp32 master copy</strong> of the weights for the optimizer,
+          while doing the compute-heavy forward/backward in bf16/fp16. Why the master copy? Because a
+          weight update is often <em>tiny</em> relative to the weight — and in low precision, adding a
+          tiny number to a large one loses the update entirely (<strong>swamping</strong>). The fp32
+          master accumulates those small updates faithfully; the low-precision copy is re-derived each
+          step.
+        </p>
+
+        <div class="code-cell" data-id="np-swamping">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Why the fp32 master copy exists</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+update, n = 1e-4, 2000
+
+w16 = torch.tensor(1.0, dtype=torch.float16)
+for _ in range(n):
+    w16 = (w16 + torch.tensor(update, dtype=torch.float16)).half()   # low-precision accumulate
+
+w32 = torch.tensor(1.0, dtype=torch.float32)
+for _ in range(n):
+    w32 = w32 + update                                               # fp32 master accumulate
+
+print(f"expected       : {1.0 + n * update:.4f}")
+print(f"fp16 accumulate: {w16.item():.4f}  <- STALLED (updates swamped)")
+print(f"fp32 accumulate: {w32.item():.4f}  <- correct")
+# this is why torch AMP keeps fp32 master weights: the optimizer updates those, not the fp16 copy.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <p>What stays in fp32 even in "mixed" precision, and why:</p>
+        <ul>
+          <li><strong>Master weights + optimizer states</strong> — the accumulation argument above.</li>
+          <li><strong>Reductions</strong> (sums over long axes: softmax denominators, layernorm
+            statistics, loss) — many small additions accumulate error fast in low precision.</li>
+          <li><strong>Loss</strong> and the final logits/softmax — precision here directly affects the
+            gradient signal.</li>
+        </ul>
+
+        <!-- ========================================================= -->
+        <h2>3. Loss scaling (the fp16 fix)</h2>
+        <p>
+          fp16's small range cuts both ways: large values overflow, and <em>small gradients underflow
+          to zero</em>. Activation gradients in a deep net are often below fp16's smallest normal
+          (~6e-5). <strong>Loss scaling</strong> multiplies the loss by a large constant
+          <code>S</code> before backward (so all gradients scale up by <code>S</code> into fp16's
+          representable range), then divides the gradients by <code>S</code> before the optimizer step.
+          bf16's wider range usually makes this unnecessary — a major reason bf16 replaced fp16.
+        </p>
+
+        <div class="code-cell" data-id="np-lossscale">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Gradient underflow &amp; loss scaling</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+grads = torch.tensor([1e-5, 1e-8, 5e-9, 2e-4])
+print("direct fp16   :", grads.half())                 # 1e-8, 5e-9 underflow to 0
+
+# torch.cuda.amp.GradScaler automates exactly this in the training loop:
+#   scaler.scale(loss).backward()   # scale UP so small grads survive fp16
+#   scaler.step(opt); scaler.update()  # unscale, step, adapt the scale factor
+S = 1024.0
+print("scaled/unscaled:", (grads * S).half().float() / S)   # small grads survive
+print("bf16 (native) :", grads.bfloat16().float())          # wide range -> no scaling
+# fp16 autocast pairs with GradScaler; bf16 autocast needs no scaler.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>4. Numerical stability of the usual suspects</h2>
+        <p>
+          Softmax and cross-entropy are the classic stability traps (also drilled on
+          <a href="python-pytorch.html">Python &amp; Tensor Fluency</a>). The rules: subtract the max
+          before <code>exp</code>; compute log-sum-exp instead of <code>log(sum(exp))</code>; never
+          form <code>log(softmax(x))</code> — use a fused <code>log_softmax</code>. The cell shows
+          naive softmax blowing up where the stable version is fine.
+        </p>
+
+        <div class="code-cell" data-id="np-stable">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Naive vs stable softmax</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch, torch.nn.functional as F
+
+x = torch.tensor([1000.0, 1001.0, 1002.0])   # large logits
+
+# torch's F.softmax and torch.logsumexp subtract the max internally -> stable, no inf/nan
+print("F.softmax :", F.softmax(x, dim=-1))
+print("logsumexp :", torch.logsumexp(x, dim=-1).item())
+# you never hand-roll the max-subtraction: F.softmax / F.log_softmax / F.cross_entropy
+# are all numerically stable. Pass raw logits to F.cross_entropy (never softmax first).</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. Determinism &amp; floating-point non-associativity</h2>
+        <p>
+          Floating-point addition is <strong>not associative</strong>: <code>(a+b)+c ≠ a+(b+c)</code>
+          in general. So the <em>order</em> of a reduction changes the result at the last bits. On GPUs,
+          parallel reductions use atomics and non-deterministic accumulation order, which is the root
+          cause of run-to-run non-determinism. Full determinism is achievable (fixed reduction order,
+          deterministic kernels) but costs performance — a real trade-off to name.
+        </p>
+
+        <div class="code-cell" data-id="np-determinism">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Sum order changes the result</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+
+# floating-point addition is non-associative in torch too -> order changes the result
+x = (torch.randn(100000) * 1e6).float()
+print("forward sum:", x.sum().item())
+print("reverse sum:", x.flip(0).sum().item())
+
+# torch exposes explicit determinism controls (they cost performance):
+#   torch.use_deterministic_algorithms(True)
+#   torch.backends.cudnn.deterministic = True
+# GPU reductions use atomics whose accumulation order varies run-to-run.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Why this matters</div>
+          <p>
+            Likely questions and the crisp answers: <em>"bf16 or fp16 for training?"</em> → bf16, its
+            fp32-equal exponent range avoids overflow/underflow, so no loss scaling needed; fp16 is
+            more precise but its 65504 ceiling is dangerous. <em>"What does loss scaling solve?"</em> →
+            fp16 gradient underflow. <em>"Why keep fp32 master weights?"</em> → tiny updates get
+            swamped when added to low-precision weights. <em>"Why is my run non-deterministic?"</em> →
+            non-associative parallel reductions; deterministic mode fixes it at a speed cost.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="np-fp8">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Discuss</span>
+            <span class="exercise-title">fp8 training — what breaks and how it's handled</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            fp8 has ~1 decimal digit of precision. Be able to explain: why fp8 is used for the matmul
+            <em>inputs</em> (compute) but accumulation stays higher precision; the two variants (e4m3
+            for weights/activations, e5m2 for gradients — precision vs range again); and per-tensor
+            (or finer) scaling factors that keep values in fp8's tiny range. What quality/stability
+            risks would you monitor?
+          </p>
+        </div>
+
+        <div class="exercise" data-id="np-mixed-impl">
+          <div class="exercise-head">
+            <span class="exercise-badge">Local exercise</span>
+            <span class="exercise-title">Mixed precision in PyTorch, with and without</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            On your machine: train a small model in fp32, then with <code>torch.autocast</code> +
+            <code>GradScaler</code> (fp16), then bf16 autocast (no scaler). Compare step time, memory,
+            and final loss. Deliberately trigger a fp16 overflow (huge LR or unscaled loss) and watch
+            the <code>GradScaler</code> skip steps / adjust the scale — seeing the machinery react
+            makes the concept stick.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) explain range vs precision from the exponent/mantissa split and rank the
+          formats; (2) say why bf16 beats fp16 for training; (3) explain master weights via the
+          swamping demo; (4) explain loss scaling and when it's needed; (5) list what stays fp32 and
+          why; (6) write stable softmax/logsumexp; (7) explain fp non-associativity as the source of
+          non-determinism and the speed trade-off of fixing it.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

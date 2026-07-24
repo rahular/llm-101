@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Scaling Laws &amp; Experiment Design · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="scaling-science">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Training science</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 06 · Training science</div>
+          <h1>Scaling Laws &amp; Experiment Design</h1>
+          <p class="lead">
+            The science layer — how to predict, plan, and measure. This is where seniority shows:
+            allocating a fixed compute budget correctly, designing clean ablations, and reading
+            results honestly. This is the discipline that turns GPU-hours into knowledge.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. The training-FLOPs identity: C ≈ 6ND</h2>
+        <p>
+          Everything starts here. Training a dense transformer costs about <strong>6 FLOPs per
+          parameter per token</strong>: 2 for the forward pass, 4 for the backward. So total compute
+          <code>C ≈ 6 · N · D</code> for <code>N</code> parameters and <code>D</code> training tokens.
+          This one identity lets you convert freely between model size, dataset size, and compute — the
+          backbone of every planning question.
+        </p>
+        <div class="formula">
+          C ≈ 6 · N · D &nbsp;&nbsp;(FLOPs) &nbsp;&nbsp;→&nbsp;&nbsp; given any two, solve the third.
+        </div>
+
+        <div class="code-cell" data-id="sc-flops">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">6ND in both directions</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">def train_flops(N, D):        return 6 * N * D
+def gpu_days(flops, tflops=400, util=0.4):
+    return flops / (tflops * 1e12 * util) / 86400
+
+# how much compute to train a 7B model on 2T tokens?
+N, D = 7e9, 2e12
+C = train_flops(N, D)
+print(f"7B x 2T tokens: {C:.2e} FLOPs")
+print(f"  ~= {gpu_days(C):.0f} GPU-days at 400 TFLOP/s & 40% MFU")
+print(f"  ~= {gpu_days(C)/1024:.1f} days on 1024 GPUs")
+
+# invert: with 1e24 FLOPs budget and 20 tokens/param, how big a model?
+C_budget = 1e24
+N_opt = (C_budget / (6 * 20)) ** 0.5      # from C=6*N*(20N)=120N^2
+print(f"\nbudget {C_budget:.0e} FLOPs -> compute-optimal N ~= {N_opt/1e9:.1f}B params")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. Scaling laws: Kaplan → Chinchilla</h2>
+        <p>
+          Loss falls as a <strong>power law</strong> in model size, data, and compute — remarkably
+          smooth over many orders of magnitude. The practically important question is: given a fixed
+          compute budget, how do you split it between a <em>bigger model</em> and <em>more tokens</em>?
+        </p>
+        <ul>
+          <li><strong>Kaplan et al. (2020)</strong> concluded you should scale model size much faster
+            than data — pushing toward large, relatively under-trained models.</li>
+          <li><strong>Chinchilla (Hoffmann et al., 2022)</strong> corrected this: model size and
+            tokens should scale <em>roughly equally</em> with compute. The compute-optimal ratio is
+            about <strong>~20 tokens per parameter</strong>. A 70B model wants ~1.4T tokens. Chinchilla
+            (70B/1.4T) beat Gopher (280B/300B tokens) using the same compute.</li>
+        </ul>
+
+        <div class="callout gotcha">
+          <div class="callout-title">⚠️ "Compute-optimal" ≠ "what you should ship"</div>
+          <p>
+            Chinchilla optimizes <em>training</em> compute for a target loss. But a deployed model is
+            run for inference billions of times, so it's usually worth <strong>overtraining a smaller
+            model</strong> well past 20 tok/param (Llama-style) — you pay more training compute to get
+            a cheaper, faster model at inference. Naming this inference-aware nuance is a strong signal.
+          </p>
+        </div>
+
+        <div class="code-cell" data-id="sc-chinchilla">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Compute-optimal allocation</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">def compute_optimal(C, tok_per_param=20):
+    # C = 6*N*D and D = tok_per_param * N  ->  C = 6*tok_per_param*N^2
+    N = (C / (6 * tok_per_param)) ** 0.5
+    D = tok_per_param * N
+    return N, D
+
+for C in [1e21, 1e22, 1e23, 1e24, 1e25]:
+    N, D = compute_optimal(C)
+    print(f"C={C:.0e}: optimal ~ {N/1e9:6.1f}B params, {D/1e12:6.2f}T tokens")
+
+# note both N and D scale as sqrt(C): 100x compute -> ~10x params AND ~10x tokens.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. Fitting a scaling law &amp; extrapolating</h2>
+        <p>
+          In practice you <em>fit</em> a power law from a handful of small runs and extrapolate to the
+          expensive target. A power law <code>L(N) = a·N^(−α)</code> is a straight line in log-log
+          space, so you fit it with a linear regression on the logs. The cell below fits an exponent
+          from noisy small-scale points and predicts the loss at 100× scale.
+        </p>
+
+        <div class="code-cell" data-id="sc-fit">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Fit a power law, extrapolate</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+
+# ground truth: L = 2.0 * N^(-0.076)
+true_alpha, a = 0.076, 2.0
+N = torch.tensor([1e7, 3e7, 1e8, 3e8, 1e9])
+L = a * N ** (-true_alpha) * (1 + 0.01 * torch.randn(N.shape))   # noisy
+
+# fit log L = log a - alpha * log N via least squares
+X = torch.stack([torch.ones_like(N.log()), N.log()], dim=1)
+sol = torch.linalg.lstsq(X, L.log()).solution
+alpha_hat, a_hat = -sol[1].item(), sol[0].exp().item()
+print(f"fitted alpha = {alpha_hat:.4f}  (true 0.076)")
+
+N_target = 1e11
+print(f"predicted loss at {N_target:.0e} params: {a_hat * N_target ** (-alpha_hat):.4f}")
+print("this is how you justify an expensive run from cheap proxy runs.")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>4. IsoFLOP analysis</h2>
+        <p>
+          The clean way to <em>find</em> the compute-optimal point: fix a compute budget, train several
+          models of different sizes (each for the token count that uses exactly that budget), and plot
+          final loss vs model size. You get a <strong>U-shape</strong> — too small underfits, too big
+          is under-trained on too few tokens — and the minimum is the optimal size for that budget.
+          Repeat across budgets to trace the scaling law. This is the Chinchilla methodology.
+        </p>
+
+        <div class="code-cell" data-id="sc-isoflop">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">The IsoFLOP U-curve</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+A, B, E = 400, 400, 1.7
+def loss(N, D): return A / N ** 0.34 + B / D ** 0.28 + E
+
+C = 1e22                        # fixed compute budget
+Ns = torch.logspace(8, 10.5, 12)
+Ds = C / (6 * Ns)               # tokens forced by the budget for each size
+Ls = loss(Ns, Ds)
+
+best = int(Ls.argmin())
+print("N (params)   D (tokens)    loss")
+for i in range(len(Ns)):
+    mark = "  <- optimal" if i == best else ""
+    print(f"{Ns[i]/1e9:7.2f}B   {Ds[i]/1e9:8.1f}B   {Ls[i].item():.4f}{mark}")
+print(f"\nU-curve minimum at ~{Ns[best]/1e9:.1f}B params for this budget.")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. Designing a clean experiment</h2>
+        <p>
+          The recurring real-world scenario: "you want to know if X helps — how do you find out?" A
+          rigorous answer covers:
+        </p>
+        <ol>
+          <li><strong>One variable.</strong> Change only X; hold architecture, data, tokens, LR
+            schedule, and seed policy fixed.</li>
+          <li><strong>Match compute, not just steps.</strong> If X changes FLOPs/step (e.g. a wider
+            FFN), compare at equal <em>total compute</em> or equal wall-clock, not equal step count —
+            otherwise you're just measuring "more compute helps."</li>
+          <li><strong>Proxy scale + ladder.</strong> Test at several small sizes and check the effect
+            <em>trend</em> holds as you scale; a win that shrinks with scale may vanish at target size.</li>
+          <li><strong>Account for noise.</strong> Run multiple seeds; report the effect size relative
+            to seed-to-seed variance. A 0.5% loss delta inside 1% seed noise is nothing.</li>
+          <li><strong>Right metric.</strong> Loss for a clean signal, but confirm on downstream evals —
+            they can diverge (next section).</li>
+        </ol>
+
+        <div class="code-cell" data-id="sc-noise">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Is the improvement real or seed noise?</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+
+baseline = 2.500 + 0.008 * torch.randn(5)     # 5 seeds, seed noise ~0.8%
+improved = 2.492 + 0.008 * torch.randn(5)
+
+diff = (baseline.mean() - improved.mean()).item()
+pooled = (baseline.var() / 5 + improved.var() / 5).sqrt().item()
+print(f"baseline: {baseline.mean():.4f} +/- {baseline.std():.4f}")
+print(f"improved: {improved.mean():.4f} +/- {improved.std():.4f}")
+print(f"mean improvement: {diff:.4f}   (SE of diff: {pooled:.4f})")
+z = diff / pooled
+print(f"z ~= {z:.2f}  -> {'likely real' if z > 2 else 'NOT distinguishable from noise'}")
+# without seeds you can't tell a real 0.3% win from noise. Always quote error bars.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>6. Evaluation: loss vs benchmarks</h2>
+        <ul>
+          <li><strong>Loss/perplexity</strong> is a smooth, low-noise signal ideal for scaling and
+            ablations — but it measures next-token prediction, not capability.</li>
+          <li><strong>Downstream benchmarks</strong> (MMLU, GSM8K, code) measure what you care about but
+            are noisy, can be gamed, and often move in steps. Loss can drop while a benchmark stays
+            flat then jumps — the "emergence" debate: some argue apparent emergence is an artifact of
+            discontinuous/thresholded metrics rather than a true phase change.</li>
+          <li><strong>Contamination</strong> silently inflates benchmarks — decontaminate against your
+            eval suite (see <a href="data-tokenization.html">Data &amp; Tokenization</a>) and report
+            contamination rather than assume zero.</li>
+        </ul>
+
+        <div class="callout insight">
+          <div class="callout-title">Why this matters</div>
+          <p>
+            "Your loss is dropping but MMLU is flat — what's happening?" Good answers: the metric may be
+            thresholded (accuracy jumps only once the model crosses a capability bar), the eval may be
+            noisy/small (widen it, add seeds), the capability may not be represented in the data mix, or
+            the benchmark may be saturated/contaminated. The meta-point: never trust a single metric;
+            triangulate loss + several evals + qualitative samples.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="sc-budget">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Exercise</span>
+            <span class="exercise-title">Plan a run from a compute budget</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            You're given 5e23 FLOPs. Using 6ND and the ~20 tok/param rule, pick the compute-optimal
+            model size and token count. Then argue how you'd adjust if the model will serve 10B
+            inference requests/day (the overtraining argument). State the GPU-days at 45% MFU on your
+            hardware of choice.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="sc-ablation-design">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Exercise</span>
+            <span class="exercise-title">Design the ablation end-to-end</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Take a concrete change (e.g. a new data source at 10% mix weight, or SwiGLU vs GeLU from
+            <a href="transformer-internals.html">Transformer Internals</a>). Write the full protocol:
+            proxy sizes, compute-matching, seeds, metrics, decision rule, and how you'd extrapolate the
+            verdict to the full run. This is the exact deliverable the "design/run/analyze experiments"
+            responsibility is testing.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) use C≈6ND fluently in both directions and estimate GPU-days; (2) state the
+          Kaplan→Chinchilla story and the ~20 tok/param rule; (3) explain why you'd overtrain past
+          compute-optimal for a deployed model; (4) fit and extrapolate a power law; (5) describe the
+          IsoFLOP U-curve method; (6) design a compute-matched, seeded ablation; (7) reason about
+          loss-vs-benchmark divergence, eval noise, and contamination.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

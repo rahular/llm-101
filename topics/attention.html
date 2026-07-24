@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Attention: Scratch → Efficient · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="attention">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Foundations</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 03 · Foundations</div>
+          <h1>Attention: Scratch → Efficient</h1>
+          <p class="lead">
+            Attention is the heart of the transformer, and implementing it from scratch is the
+            single best exercise for understanding LLMs. This page walks from the raw math to a from-scratch
+            implementation, then to the efficiency story — GQA, KV cache, FlashAttention — that
+            turns the textbook version into the one production systems actually run.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. Scaled dot-product attention, from the definition</h2>
+        <p>
+          Attention lets each position build a query, compare it against every position's key, and
+          read out a weighted mix of values. With queries <code>Q ∈ ℝ^{T×d}</code>, keys
+          <code>K ∈ ℝ^{T×d}</code>, values <code>V ∈ ℝ^{T×d}</code>:
+        </p>
+        <div class="formula">
+          Attention(Q, K, V) = softmax( QKᵀ / √d ) V
+        </div>
+        <p>
+          <code>QKᵀ</code> is a <code>(T×T)</code> matrix of similarity scores; the row-wise softmax
+          turns each query's scores into a distribution over positions; multiplying by <code>V</code>
+          reads out the weighted average. Three things to be able to justify on demand:
+        </p>
+        <ul>
+          <li><strong>Why divide by √d?</strong> Q and K entries are ~unit variance, so each dot
+            product over <code>d</code> terms has variance ~<code>d</code>. Without the
+            <code>1/√d</code> scale, logits grow with <code>d</code>, pushing softmax into
+            saturated regions where gradients vanish. The scale keeps logit variance ~1.</li>
+          <li><strong>Softmax is row-wise</strong> — over the <em>keys</em> axis. Getting the axis
+            wrong is the most common bug; each query must sum to 1 over keys.</li>
+          <li><strong>Shapes</strong>: scores <code>(T,T)</code>, output <code>(T,d)</code> — same
+            shape as the input, which is what lets you stack blocks.</li>
+        </ul>
+
+        <div class="code-cell" data-id="attn-sdpa">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Single-head attention from scratch</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch, torch.nn.functional as F
+torch.manual_seed(0)
+
+seqlen, d_model = 4, 8
+x = torch.randn(seqlen, d_model)
+Wq, Wk, Wv = (torch.randn(d_model, d_model) for _ in range(3))
+q, k, v = x @ Wq, x @ Wk, x @ Wv
+
+# the explicit form: scale, softmax, matmul
+scores = q @ k.transpose(-2, -1) / d_model ** 0.5
+out_manual = F.softmax(scores, dim=-1) @ v
+
+# the one-liner you actually use: scale + softmax + matmul fused (FlashAttention)
+out_sdpa = F.scaled_dot_product_attention(q, k, v)
+
+print("output shape:", tuple(out_sdpa.shape))
+print("manual == SDPA:", torch.allclose(out_manual, out_sdpa, atol=1e-5))</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. Causal masking</h2>
+        <p>
+          A decoder LM must not let position <code>t</code> attend to future positions. We enforce
+          this by setting the scores above the diagonal to <code>−∞</code> <em>before</em> the
+          softmax, so their weights become exactly 0. Use <code>−∞</code> (or a large negative like
+          <code>−1e9</code>), never a post-softmax zero-out — masking after softmax breaks the
+          normalization.
+        </p>
+
+        <div class="code-cell" data-id="attn-causal">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Causal mask</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch, torch.nn.functional as F
+torch.manual_seed(0)
+
+seqlen, d_model = 5, 8
+q, k, v = (torch.randn(seqlen, d_model) for _ in range(3))
+
+# manual mask: -inf above the diagonal, before softmax
+scores = q @ k.transpose(-2, -1) / d_model ** 0.5
+mask = torch.triu(torch.ones(seqlen, seqlen, dtype=torch.bool), diagonal=1)
+w = F.softmax(scores.masked_fill(mask, float('-inf')), dim=-1)
+print("weights (lower-triangular):")
+print(w.round(decimals=2))
+
+# in practice, let SDPA build the causal mask for you:
+out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+print("is_causal=True applies exactly this mask, fused.")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="callout gotcha">
+          <div class="callout-title">⚠️ Gotcha: −inf rows and NaNs</div>
+          <p>
+            If an entire softmax row is <code>−inf</code> (can happen with padding masks on empty
+            positions), <code>exp</code> gives all zeros and you divide 0/0 → <code>NaN</code>. The
+            causal mask never fully masks a row (position <code>t</code> always sees itself), but
+            padding masks can. Real kernels guard this; worth mentioning if asked about edge cases.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. Multi-head attention</h2>
+        <p>
+          One attention head can only average one way. Multi-head attention runs <code>H</code>
+          attention operations in parallel on <code>d = D/H</code>-dimensional projections, letting
+          different heads specialize (syntax, coreference, positional patterns). The heads are
+          concatenated and mixed by an output projection <code>W_o</code>.
+        </p>
+        <p>
+          The implementation trick is to do it with <em>batched</em> matmuls, not a Python loop over
+          heads: project to <code>d_model</code>, reshape to <code>(batch, seqlen, n_heads, head_dim)</code>,
+          transpose to <code>(batch, n_heads, seqlen, head_dim)</code>, and let the last two axes be the matrix dims. (Revisit the
+          reshape/transpose mechanics on <a href="python-pytorch.html">Python &amp; Tensor Fluency</a>.)
+        </p>
+
+        <div class="code-cell" data-id="attn-mha">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Batched multi-head attention (no loops)</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch, torch.nn as nn, torch.nn.functional as F
+torch.manual_seed(0)
+
+class MHA(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.o = nn.Linear(d_model, d_model, bias=False)
+    def forward(self, x):
+        batch, seqlen, d_model = x.shape
+        head_dim = d_model // self.n_heads
+        q, k, v = self.qkv(x).split(d_model, dim=-1)
+        split = lambda t: t.view(batch, seqlen, self.n_heads, head_dim).transpose(1, 2)  # (batch, n_heads, seqlen, head_dim)
+        y = F.scaled_dot_product_attention(split(q), split(k), split(v), is_causal=True)
+        return self.o(y.transpose(1, 2).reshape(batch, seqlen, d_model))
+
+batch, seqlen, d_model, n_heads = 2, 6, 32, 4
+mha = MHA(d_model, n_heads)
+x = torch.randn(batch, seqlen, d_model)
+print("input:", tuple(x.shape), "-> output:", tuple(mha(x).shape))
+# no explicit mask/softmax loop -- SDPA fuses it.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="exercise" data-id="attn-verify-heads">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Drill</span>
+            <span class="exercise-title">Prove batched == per-head loop</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Add a second implementation of <code>mha</code> that loops over heads with a plain
+            single-head <code>attention</code> and concatenates. Assert the max abs difference vs
+            the batched version is < 1e-10. This is exactly the kind of "make it fast, prove it's
+            still correct" discipline that separates working optimizations from silent bugs.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>4. MHA → MQA → GQA</h2>
+        <p>
+          At inference, the KV cache (next section) dominates memory. Multi-Query Attention (MQA)
+          shares a <em>single</em> K/V head across all query heads; Grouped-Query Attention (GQA)
+          interpolates — <code>G</code> KV heads shared by groups of query heads. GQA is the modern
+          default (Llama-2 70B, Llama-3, most current models) because it cuts KV-cache size by
+          <code>H/G</code>× with almost no quality loss.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Scheme</th><th>Query heads</th><th>KV heads</th><th>KV cache vs MHA</th><th>Trade-off</th></tr></thead>
+            <tbody>
+              <tr><td>MHA</td><td>H</td><td>H</td><td>1×</td><td>Best quality, largest cache</td></tr>
+              <tr><td>GQA</td><td>H</td><td>G (1&lt;G&lt;H)</td><td>G/H×</td><td>Sweet spot; near-MHA quality</td></tr>
+              <tr><td>MQA</td><td>H</td><td>1</td><td>1/H×</td><td>Smallest cache, some quality loss</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Implementation-wise, GQA just means K and V have shape <code>(B, G, T, d)</code> and you
+          <em>repeat</em> each KV head to serve <code>H/G</code> query heads before the score
+          matmul (<code>torch.repeat_interleave</code> along the head axis, or broadcast).
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>5. The KV cache</h2>
+        <p>
+          Autoregressive generation produces one token at a time. Naively, generating token
+          <code>t</code> re-runs attention over all <code>t</code> positions — <code>O(T²)</code>
+          recompute for a sequence. The KV cache stores the K and V projections of all past tokens,
+          so each new step computes attention with a single new query against the cached keys/values:
+          per-step cost drops from <code>O(t·d)</code> recompute of K/V to <code>O(d)</code>. This is
+          the difference between usable and unusable inference. (Raschka's <em>Build a Reasoning
+          Model</em> §2.8 walks a minimal implementation if you want a reference.)
+        </p>
+        <div class="callout">
+          <div class="callout-title">KV cache memory — know this formula cold</div>
+          <p class="formula" style="margin:0.4rem 0 0">
+            bytes = 2 (K &amp; V) × layers × seqlen × kv_heads × head_dim × bytes/elt × batch
+          </p>
+        </div>
+
+        <div class="code-cell" data-id="attn-kvcache">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">KV-cache size calculator</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">def kv_cache_gb(layers, kv_heads, head_dim, seqlen, batch, bytes_per=2):
+    elts = 2 * layers * seqlen * kv_heads * head_dim * batch   # 2 = K and V
+    return elts * bytes_per / 1e9
+
+# ~Llama-3-8B-ish: 32 layers, d_model=4096, 32 query heads, head_dim=128.
+# MHA would use 32 kv-heads; it actually uses GQA with 8 kv-heads.
+for name, kv in [("MHA (32 kv-heads)", 32), ("GQA (8 kv-heads)", 8)]:
+    gb = kv_cache_gb(layers=32, kv_heads=kv, head_dim=128, seqlen=8192, batch=1)
+    print(f"{name:22s}: {gb:.2f} GB per sequence @ 8k ctx, bf16")
+
+# 4x smaller cache is why GQA lets you fit far more concurrent sequences.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>6. FlashAttention — the efficiency centerpiece</h2>
+        <p>
+          Standard attention materializes the full <code>(seqlen × seqlen)</code> scores matrix in HBM
+          (GPU main memory). That matrix is <code>O(seqlen²)</code> in memory and, crucially, attention
+          is <strong>memory-bandwidth bound</strong>: the arithmetic is cheap relative to the HBM reads
+          and writes of that big intermediate. FlashAttention (Dao et al., 2022) computes exact
+          attention <em>without ever writing the full scores matrix to HBM</em>, by tiling the
+          computation and keeping tiles in fast on-chip SRAM.
+        </p>
+        <p>The two ideas:</p>
+        <ul>
+          <li><strong>Tiling</strong>: process blocks of queries against blocks of keys/values, keeping
+            the working set in SRAM. HBM traffic drops from <code>O(seqlen²)</code> to
+            <code>O(seqlen²/M)</code> where <code>M</code> is the SRAM size — a large constant-factor win.</li>
+          <li><strong>Online softmax</strong>: to combine block results without seeing all keys at once,
+            maintain a running max and running normalizer, rescaling the accumulated output as each new
+            block arrives. This makes the result <strong>exact</strong>, not an approximation — a point
+            is often misunderstood.</li>
+        </ul>
+        <p>
+          You rarely need to write CUDA yourself, but you should be able to explain online softmax. In
+          PyTorch you don't implement it yourself — <code>F.scaled_dot_product_attention</code>
+          dispatches to a FlashAttention kernel. The cell confirms SDPA returns exactly the plain,
+          fully-materialized result.
+        </p>
+
+        <div class="code-cell" data-id="attn-online-softmax">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">SDPA (FlashAttention) == the plain computation</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch, torch.nn.functional as F
+torch.manual_seed(0)
+
+seqlen, d_k, d_v = 17, 8, 5
+q = torch.randn(d_k)
+K = torch.randn(seqlen, d_k); V = torch.randn(seqlen, d_v)
+
+# reference: plain full attention for a single query (materializes all scores)
+ref = F.softmax((K @ q) / d_k ** 0.5, dim=-1) @ V
+
+# SDPA's backend (FlashAttention) does the tiling + online softmax internally.
+# Same result, via the batched (batch, n_heads, seqlen, head_dim) API:
+out = F.scaled_dot_product_attention(q.view(1, 1, 1, d_k), K.view(1, 1, seqlen, d_k),
+                                     V.view(1, 1, seqlen, d_v)).view(d_v)
+print("max diff (SDPA vs reference):", (ref - out).abs().max().item())
+# ~0 -> tiling + online softmax is EXACT, not an approximation.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Why this matters</div>
+          <p>
+            If asked "why is FlashAttention faster if it does the same FLOPs (or slightly more)?",
+            the answer is the roofline: attention is memory-bound, so cutting HBM traffic — not
+            FLOPs — is what buys speed. FlashAttention trades a bit of recompute for far less memory
+            movement, and also drops peak memory from <code>O(T²)</code> to <code>O(T)</code>, which
+            is what unlocks long context. FlashAttention-2/3 refine the work partitioning and use
+            newer-GPU features; know they exist.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>7. Roofline &amp; arithmetic intensity</h2>
+        <p>
+          The mental model behind every "is this kernel good?" question. Arithmetic intensity =
+          FLOPs / bytes moved. A kernel is <strong>compute-bound</strong> if its intensity exceeds
+          the hardware's FLOP:bandwidth ratio (the "ridge point"), else
+          <strong>memory-bound</strong>. Big dense matmuls (like the FFN) are compute-bound; softmax,
+          layernorm, elementwise ops, and naive attention are memory-bound. This is <em>why</em>
+          kernel fusion and FlashAttention matter: they raise arithmetic intensity by avoiding
+          round-trips to HBM.
+        </p>
+        <div class="formula">
+          A100: ~312 TFLOP/s (bf16) ÷ ~2.0 TB/s HBM ≈ 156 FLOP/byte ridge point. <br />
+          Below that intensity → you're bandwidth-limited.
+        </div>
+
+        <div class="exercise" data-id="attn-flops">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Exercise</span>
+            <span class="exercise-title">Count attention FLOPs and find the bottleneck</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            For a single attention layer with batch <code>B</code>, seq <code>T</code>, model dim
+            <code>D</code>: write expressions for the FLOPs of (a) the QKV projections, (b) the
+            <code>QKᵀ</code> scores, (c) the <code>×V</code> readout, (d) the output projection. At
+            what sequence length <code>T</code> does the <code>O(T²)</code> attention term overtake
+            the <code>O(T·D²)</code> projection term? (This is why long context is expensive and why
+            attention-efficiency is a whole research area.)
+          </p>
+          <details class="solution">
+            <summary>Show answer sketch</summary>
+            <p>
+              Projections: ~<code>3·2·B·T·D²</code> (QKV) + <code>2·B·T·D²</code> (out).
+              Scores + readout: ~<code>2·2·B·T²·D</code>. The attention term overtakes the
+              projection term when <code>T ≳ D</code> (roughly). So for <code>D≈4096</code>,
+              attention cost dominates once context passes a few thousand tokens — the regime where
+              FlashAttention and linear/sparse-attention variants earn their keep.
+            </p>
+          </details>
+        </div>
+
+        <div class="exercise" data-id="attn-gqa-impl">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Local exercise</span>
+            <span class="exercise-title">Implement GQA + a KV cache in PyTorch</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            On your machine: extend the batched <code>mha</code> above to GQA (K/V with
+            <code>G &lt; H</code> heads, repeated to serve query-head groups), then add a KV cache so
+            that a decode step takes a single new token and appends to cached K/V. Benchmark tokens/s
+            with and without the cache at 512-token context. This is the classic "optimize the
+            throughput of novel attention mechanisms" almost exactly.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can, from a blank editor: (1) write single-head then batched multi-head attention
+          with a causal mask; (2) explain the √d scale and the row-wise softmax axis; (3) contrast
+          MHA/GQA/MQA and state the KV-cache formula; (4) explain FlashAttention as a memory-movement
+          win and implement online softmax that matches the naive result exactly; (5) reason about
+          when attention is compute- vs memory-bound via the roofline.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

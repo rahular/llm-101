@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Optimizer Frontier · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="optimizer-frontier">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Frontier</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 13 · Frontier</div>
+          <h1>Optimizer Frontier</h1>
+          <p class="lead">
+            The optimizer is back on the research frontier. AdamW was the unquestioned default for years,
+            but 2024–2025 saw the first optimizers to credibly beat it at scale — most notably
+            <strong>Muon</strong>, now used in trillion-parameter runs. This page covers Lion,
+            Shampoo/SOAP, and Muon, with the Newton–Schulz orthogonalization at Muon's core as a runnable
+            cell.
+          </p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">Prerequisite</div>
+          <p>
+            Assumes AdamW, momentum, and decoupled weight decay from
+            <a href="training-dynamics.html">Training Dynamics &amp; Optimizers</a>. The organizing
+            question here: AdamW uses a <em>diagonal</em> preconditioner (per-scalar adaptive LR). Every
+            method below asks "what if we used the <em>matrix</em> structure of the gradient instead?"
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. Why look past AdamW</h2>
+        <p>
+          Adam rescales each parameter independently by its own gradient history — a <em>diagonal</em>
+          approximation to the curvature. It ignores that a weight <em>matrix</em>'s gradient has
+          structure: correlations between rows and columns, an ill-conditioned spectrum. The frontier
+          optimizers exploit that structure, either cheaply (Lion: sign) or with genuine second-order /
+          matrix information (Shampoo, SOAP, Muon). The useful level of fluency is the one-line pitch and
+          trade-off of each.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>2. Lion — sign-based, half the memory</h2>
+        <p>
+          <strong>Lion</strong> (EvoLved Sign Momentum, discovered by symbolic program search) is the
+          minimalist. It keeps a <em>single</em> momentum buffer (half of Adam's two) and its update is
+          just the <strong>sign</strong> of an interpolated momentum — so every parameter takes a step of
+          identical magnitude <code>±lr</code>, direction only. Cheaper memory and often competitive, but
+          the uniform step size means it needs a <em>smaller</em> LR and <em>larger</em> weight decay than
+          Adam.
+        </p>
+        <div class="formula">
+          update = sign(β₁·mₜ₋₁ + (1−β₁)·gₜ) &nbsp;&nbsp; wₜ = wₜ₋₁ − lr·(update + λw) <br />
+          mₜ = β₂·mₜ₋₁ + (1−β₂)·gₜ &nbsp; (one state; β₁ for the step, β₂ for the EMA)
+        </div>
+
+        <div class="code-cell" data-id="of-lion">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Lion vs Adam: state &amp; update</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+def lion_step(w, g, lr, m, b1=0.9, b2=0.99, wd=0.1):
+    update = torch.sign(b1 * m + (1 - b1) * g)   # SIGN -> uniform magnitude
+    w = w - lr * (update + wd * w)               # decoupled weight decay
+    m = b2 * m + (1 - b2) * g                     # single momentum buffer
+    return w, m
+
+w = torch.tensor([0.5, -2.0, 0.01, 5.0]); m = torch.zeros(4)
+g = torch.tensor([10.0, -0.3, 0.001, 2.0])       # wildly different magnitudes
+w_new, m = lion_step(w, g, 1e-2, m)
+print("gradient   :", g.tolist())
+print("Lion update:", torch.sign(0.1 * g).tolist(), " <- only the SIGN matters")
+print("Adam states/param: 2 (m, v).  Lion: 1 (m)  -> ~half optimizer memory")
+print("Uniform step size -> Lion needs lower LR + higher weight decay than Adam.")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. Shampoo &amp; SOAP — full matrix preconditioning</h2>
+        <p>
+          <strong>Shampoo</strong> is a practical second-order method. For a weight matrix
+          <code>W ∈ ℝ^{m×n}</code> with gradient <code>G</code>, it maintains two
+          <em>Kronecker-factored</em> preconditioners — a left <code>L = Σ GGᵀ</code> (m×m) and a right
+          <code>R = Σ GᵀG</code> (n×n) — and preconditions the update as
+          <code>L^{−1/4} G R^{−1/4}</code>. This captures row/column curvature that Adam's diagonal
+          misses, and converges in fewer steps — but computing matrix inverse-4th-roots periodically is
+          expensive, so it's amortized over many steps and distributed across devices.
+        </p>
+        <div class="formula">
+          Lₜ = Lₜ₋₁ + GGᵀ &nbsp; Rₜ = Rₜ₋₁ + GᵀG &nbsp;&nbsp; W ← W − lr · Lₜ^(−1/4) G Rₜ^(−1/4)
+        </div>
+
+        <div class="code-cell" data-id="of-shampoo">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Shampoo's Kronecker-factored preconditioner (toy)</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+
+def matrix_power(M, p, eps=1e-6):
+    vals, vecs = torch.linalg.eigh(M + eps * torch.eye(M.shape[0]))
+    return (vecs * vals.clamp(min=eps) ** p) @ vecs.T
+
+m, n = 5, 3
+L = torch.zeros(m, m); R = torch.zeros(n, n)
+for _ in range(10):
+    G = torch.randn(m, n)
+    L += G @ G.T          # (m,m) left factor  -> row curvature
+    R += G.T @ G          # (n,n) right factor -> column curvature
+
+G = torch.randn(m, n)
+update = matrix_power(L, -0.25) @ G @ matrix_power(R, -0.25)   # L^-1/4 G R^-1/4
+print("update shape:", tuple(update.shape))
+print("Shampoo whitens with row (L) AND column (R) structure Adam's diagonal can't see.")
+print("Cost: matrix inverse-roots (torch.linalg.eigh) -> amortize over many steps.")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <p>
+          <strong>SOAP</strong> (Shampoo with Adam in the Preconditioner's eigenbasis, ICLR 2025)
+          stabilizes Shampoo by running Adam-style moment updates <em>in the eigenbasis</em> of Shampoo's
+          preconditioner. It's more robust to how often you refresh the (expensive) eigendecomposition and
+          reports ~15% wall-clock improvement over AdamW. The one-liner: Shampoo tells you the right basis;
+          Adam adapts within it.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>4. Muon — orthogonalized momentum (the headline)</h2>
+        <p>
+          <strong>Muon</strong> (MomentUm Orthogonalized by Newton–Schulz; Jordan et al., 2024) is the
+          optimizer that credibly beats AdamW at scale. The idea: take the momentum matrix <code>M</code>,
+          and <strong>orthogonalize</strong> it before stepping — replace <code>M = UΣVᵀ</code> with
+          <code>UVᵀ</code> (all singular values set to 1). This is the closest orthogonal (equal-scale)
+          matrix to the update, which prevents a few dominant directions from hogging the step and uses the
+          full parameter space each update.
+        </p>
+        <p>
+          Computing <code>UVᵀ</code> via SVD every step would be far too slow, so Muon uses a few
+          (~5) iterations of a tuned <strong>Newton–Schulz</strong> polynomial in bf16 to approximate it.
+          It applies <em>only to 2D matrix parameters</em>; embeddings, the output head, norms, and biases
+          stay on AdamW.
+        </p>
+        <div class="formula">
+          Mₜ = μMₜ₋₁ + Gₜ &nbsp;→&nbsp; Oₜ = NewtonSchulz(Mₜ) ≈ UVᵀ &nbsp;→&nbsp; W ← W − lr·(Oₜ·scale + λW) <br />
+          NS iterate: X ← aX + b(XXᵀ)X + c(XXᵀ)²X, &nbsp; (a,b,c)=(3.4445, −4.7750, 2.0315)
+        </div>
+
+        <div class="code-cell" data-id="of-muon">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Newton–Schulz orthogonalization (Muon's core)</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+
+def newton_schulz(G, steps=5):
+    a, b, c = 3.4445, -4.7750, 2.0315          # Jordan's tuned quintic
+    X = G / (G.norm() + 1e-7)                   # normalize: largest singular value <= 1
+    transpose = X.shape[0] > X.shape[1]
+    if transpose: X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        X = a * X + (b * A + c * A @ A) @ X
+    if transpose: X = X.T
+    return X
+
+M = torch.randn(6, 4) * 3.0                     # a momentum matrix, wide spectrum
+O = newton_schulz(M, steps=5)
+print("singular values of M:", torch.linalg.svdvals(M).round(decimals=2).tolist())
+print("singular values of O:", torch.linalg.svdvals(O).round(decimals=2).tolist())
+print("-> the wide spectrum is squashed into a tight BAND around 1 (a fixed ~5-iter approx")
+print("   of UVᵀ). Every direction of the update gets ~equal scale, none dominates.")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Why Muon works &amp; scales</div>
+          <p>
+            Intuition: Adam's diagonal scaling can let a handful of high-variance directions dominate;
+            orthogonalizing the update spreads the step evenly across all directions of the weight matrix,
+            effectively conditioning the update without a full second-order inverse. Empirically it reaches
+            a target loss in fewer tokens — Moonshot's scaling-law study reported roughly <strong>2×
+            compute efficiency vs AdamW</strong>, and Muon powered <strong>Kimi K2</strong> (~1T-param MoE,
+            32B active). The two tricks that made it scale: <strong>add weight decay</strong>, and
+            <strong>tune the per-parameter update scale</strong> (e.g. ∝ √max(m,n)) so it matches AdamW's
+            effective step. Stability add-on at scale: <strong>QK-clip</strong> for attention logits.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. Choosing — the comparison</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Optimizer</th><th>State / param</th><th>Uses matrix structure?</th><th>Pitch</th></tr></thead>
+            <tbody>
+              <tr><td>AdamW</td><td>2 (m, v)</td><td>no (diagonal)</td><td>robust default</td></tr>
+              <tr><td>Lion</td><td>1 (m)</td><td>no (sign)</td><td>half the memory, needs lower LR</td></tr>
+              <tr><td>Shampoo</td><td>2 factors (L, R)</td><td>yes (Kronecker 2nd-order)</td><td>fewer steps, costly roots</td></tr>
+              <tr><td>SOAP</td><td>factors + Adam moments</td><td>yes (eigenbasis + Adam)</td><td>stabler Shampoo, ~15% faster than AdamW</td></tr>
+              <tr><td>Muon</td><td>1 (momentum) for 2D params</td><td>yes (orthogonalization)</td><td>~2× efficiency, proven at 1T scale</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout gotcha">
+          <div class="callout-title">⚠️ Hybrid by construction</div>
+          <p>
+            Muon and Shampoo apply to <strong>2D weight matrices only</strong>. Embeddings, the LM head,
+            LayerNorm/RMSNorm gains, and biases are 1D (or best treated per-element) — those stay on
+            AdamW. So a "Muon run" is really Muon + AdamW. Forgetting this is a common wrong answer.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="of-muon-train">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Exercise</span>
+            <span class="exercise-title">Muon vs AdamW on an ill-conditioned problem</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Extend the Newton–Schulz cell into a full Muon step (momentum → orthogonalize → scaled update)
+            and race it against AdamW minimizing a badly-conditioned matrix least-squares loss
+            (<code>‖WX − Y‖²</code> with <code>X</code> ill-conditioned). Plot loss vs steps and confirm
+            Muon reaches the target in fewer steps. Then break it deliberately by applying Muon to a 1D
+            parameter and observe why matrix methods need the 2D structure.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="of-optim-impl">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Local exercise</span>
+            <span class="exercise-title">Implement Muon + AdamW hybrid in PyTorch</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            On your machine: write a training loop that routes 2D weight matrices to a Muon optimizer
+            (momentum + Newton–Schulz in bf16, ~5 steps, √max(m,n) scale, weight decay) and everything
+            else to AdamW. Train a small transformer and compare tokens-to-target-loss against pure AdamW.
+            Reference: Keller Jordan's Muon and the Moonlight/Kimi technical reports.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) explain why AdamW's diagonal preconditioner leaves structure on the table;
+          (2) write Lion's sign update and state its memory/LR/weight-decay trade-offs; (3) explain
+          Shampoo's Kronecker-factored preconditioner and why it's amortized, plus what SOAP adds;
+          (4) explain Muon as momentum orthogonalization, implement Newton–Schulz, and cite the ~2×
+          efficiency + 1T-scale evidence; (5) know that Muon/Shampoo are 2D-only and pair with AdamW.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

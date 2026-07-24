@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Case Study: Qwen 3.6 · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="case-qwen">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Case studies</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 23 · Case studies</div>
+          <h1>Case Study: Qwen 3.6</h1>
+          <p class="lead">
+            The cleanest production validation of the linear-attention hybrid thesis from
+            <a href="attention-variants.html">Attention Variants</a>: three quarters of the network is
+            <strong>Gated DeltaNet</strong>, and the models are aggressively <em>tiny-active</em> MoE —
+            a 35B model that runs 3B of parameters per token and still "thinks, codes, and agents"
+            like something much bigger.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. The 3:1 hybrid, as a repeating macro-block</h2>
+        <p>
+          Qwen 3.6's layer stack is literally a tiling of one pattern:
+        </p>
+        <div class="formula">
+          35B-A3B: 10 × [ 3 × (Gated DeltaNet → MoE) → 1 × (Gated Attention → MoE) ] <br />
+          27B dense: 16 × [ 3 × (Gated DeltaNet → FFN) → 1 × (Gated Attention → FFN) ]
+        </div>
+        <p>
+          75% of sublayers are linear attention (fixed-size recurrent state, no KV-cache growth), and
+          every fourth attention layer is full softmax attention for exact long-range recall. Qwen's
+          reported ablation is the fact to memorize: <strong>the 3:1 hybrid outperforms either
+          monolithic architecture</strong> — better than all-DeltaNet <em>and</em> better than
+          all-softmax — while being far cheaper at long context. Hybridization isn't a compromise; it's
+          the optimum.
+        </p>
+        <div class="callout gotcha">
+          <div class="callout-title">⚠️ The detail most people miss: asymmetric heads</div>
+          <p>
+            In the 27B dense variant, the linear-attention layers use <strong>48 heads for V but only
+            16 for Q/K</strong> (head_dim 128). The DeltaNet state is a per-head
+            <code>(head_dim × head_dim)</code> matrix — value capacity is what the fixed state is
+            short of, so Qwen spends heads where the memory bottleneck actually is, rather than keeping
+            the symmetric Q/K/V head count softmax attention defaults to.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. Tiny-active MoE</h2>
+        <p>
+          35B total / <strong>3B active</strong> is ~8.6% activation — and the smaller sibling of a
+          field-wide race toward extreme sparsity (see the
+          <a href="case-inkling-synthesis.html">synthesis page</a> for the cross-model table). The
+          practical framing: total parameters set what the model <em>knows</em>; active parameters set
+          what a token <em>costs</em>. Qwen's bet is that a consumer-deployable cost point (3B active)
+          can carry near-frontier capability if the knowledge pool behind it is 10× larger.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>3. Multi-step MTP → self-speculative decoding</h2>
+        <p>
+          Qwen 3.6 trains <strong>multi-token prediction with multiple steps</strong> — auxiliary heads
+          predicting several future tokens, not just one. Besides the usual MTP training-signal benefit,
+          the multi-step heads double as a built-in <strong>draft model</strong>: at inference the model
+          drafts several tokens ahead with the cheap MTP heads and verifies them with the full forward
+          pass — <em>self-speculative decoding</em> with no separate draft network to train, deploy, or
+          keep in sync. Speculative decoding's usual ops problem (maintaining a second model) disappears.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>4. Long context as a default, not a variant</h2>
+        <p>
+          Native context is <strong>262K</strong>, extendable to ~1M. This is what the 3:1 hybrid buys:
+          with 75% of layers holding a fixed-size state, the KV cache only grows in a quarter of the
+          layers, so long context stops being a memory catastrophe
+          (<a href="code-kv-cache.html">KV-Cache Inference §6</a>). The full-attention layers — the only
+          ones paying the growing-cache cost — are exactly the ones providing verbatim recall.
+        </p>
+
+        <div class="callout insight">
+          <div class="callout-title">Why this matters</div>
+          <p>
+            Qwen 3.6 is the model to cite when asked "would you use linear attention in production?" —
+            the answer is the ratio, not the religion: <em>"Qwen 3.6 ships 75% Gated DeltaNet / 25%
+            softmax and their ablations show the hybrid beats both extremes; the full-attention layers
+            carry recall, the linear layers carry cost."</em> Bonus points for the asymmetric-head
+            detail and for MTP-as-free-draft-model, which shows you think about inference economics,
+            not just training loss.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) write out the 3:1 macro-block pattern and state the hybrid-beats-both
+          ablation; (2) explain <em>why</em> V gets more heads than Q/K in the linear layers;
+          (3) explain multi-step MTP and how it enables self-speculative decoding; (4) connect 75%
+          fixed-state layers to 262K-native context; (5) frame total-vs-active params as
+          knowledge-vs-cost.</p>
+        </div>
+
+        <p class="footnote">
+          Sources: <a href="https://huggingface.co/blog/EXDai/qwen36-35b-a3b-architecture-overview">Qwen3.6-35B-A3B
+          architecture overview</a>; <a href="https://huggingface.co/Qwen/Qwen3.6-27B">Qwen3.6-27B model
+          card</a>; <a href="https://arxiv.org/html/2505.09388v1">Qwen3 technical report</a> (lineage).
+        </p>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

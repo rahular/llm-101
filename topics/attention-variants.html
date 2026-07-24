@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Attention Variants &amp; SSMs · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="attention-variants">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Frontier</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 12 · Frontier</div>
+          <h1>Attention Variants &amp; SSMs</h1>
+          <p class="lead">
+            Optimizing the throughput of novel attention mechanisms is one of the defining
+            engineering problems of this model generation. Softmax attention is <code>O(T²)</code> and its KV cache grows without
+            bound — so a whole frontier of sub-quadratic alternatives exists. This page traces the
+            line from linear attention → state-space models → DeltaNet / Gated DeltaNet, and the
+            hybrid designs (Qwen3-Next, MiniMax, Jamba) where the field has actually landed.
+          </p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">Prerequisite</div>
+          <p>
+            This assumes standard softmax attention, KV cache, and the roofline from
+            <a href="attention.html">Attention: Scratch → Efficient</a>. The recurring theme here is
+            one trade-off: an <strong>unbounded</strong> KV cache (perfect recall, <code>O(T²)</code>)
+            vs a <strong>bounded</strong> recurrent state (cheap <code>O(T)</code>, lossy recall).
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. Linear attention: drop the softmax, gain associativity</h2>
+        <p>
+          Softmax attention computes <code>softmax(QKᵀ)V</code> — the softmax couples all keys, forcing
+          you to build the full <code>T×T</code> matrix. <strong>Linear attention</strong> replaces
+          <code>exp(qᵀk)</code> with a factored similarity <code>φ(q)ᵀφ(k)</code>. That small change
+          unlocks <strong>associativity</strong>: you can compute <code>(φ(K)ᵀV)</code> first — a
+          fixed <code>d×d</code> matrix — instead of <code>(Qφ(K)ᵀ)</code>, turning <code>O(T²d)</code>
+          into <code>O(Td²)</code> and giving a recurrent form with <strong>constant</strong> per-token
+          cost and no growing KV cache.
+        </p>
+        <div class="formula">
+          softmax:&nbsp; oₜ = Σᵢ exp(qₜ·kᵢ) vᵢ / Σᵢ exp(qₜ·kᵢ) <br />
+          linear:&nbsp;&nbsp; oₜ = φ(qₜ)ᵀ Σᵢ₌₁ᵗ φ(kᵢ) vᵢᵀ &nbsp;=&nbsp; φ(qₜ)ᵀ Sₜ, &nbsp; Sₜ = Sₜ₋₁ + φ(kₜ) vₜᵀ
+        </div>
+
+        <div class="code-cell" data-id="av-linear">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Parallel form == recurrent scan (the whole trick)</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+
+seqlen, dim = 6, 8
+Q, K, V = torch.randn(seqlen, dim), torch.randn(seqlen, dim), torch.randn(seqlen, dim)
+
+# PARALLEL (quadratic): causal, NO softmax
+A = torch.tril(Q @ K.T)
+O_parallel = A @ V
+
+# RECURRENT (linear time): carry a dim×dim state, O(1) per token
+O_recurrent = torch.zeros(seqlen, dim)
+S = torch.zeros(dim, dim)                   # S = sum_i k_i v_i^T
+for t in range(seqlen):
+    S = S + torch.outer(K[t], V[t])         # update state
+    O_recurrent[t] = Q[t] @ S               # read: q_t · S
+
+print("max abs diff parallel vs recurrent:", (O_parallel - O_recurrent).abs().max().item())
+print("~0 -> the recurrent form is O(seqlen) with a FIXED dim×dim state (no KV-cache growth).")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="callout gotcha">
+          <div class="callout-title">⚠️ The catch: bounded memory</div>
+          <p>
+            The <code>d×d</code> state <code>S</code> is a <em>fixed-size</em> summary of the entire
+            past — unlike the KV cache, which stores every token. That's exactly why linear attention
+            is cheap, and exactly why early versions underperformed on recall/associative tasks: you're
+            compressing unbounded history into constant memory. Every design below is a smarter way to
+            <em>manage</em> that fixed budget.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. The RNN duality</h2>
+        <p>
+          The recurrent form above <em>is</em> a linear RNN with a matrix hidden state. This is the key
+          reframing of the last few years: linear attention, state-space models, and the DeltaNet
+          family are all <strong>linear RNNs</strong> that differ only in how the state
+          <code>S</code> is updated and decayed. That unification is why they share the same
+          chunk-parallel training trick (compute in parallel over chunks, recur across chunks) and the
+          same <code>O(1)</code>-inference benefit.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>3. State-space models: Mamba &amp; Mamba-2</h2>
+        <p>
+          State-space models (SSMs) come from control theory: a hidden state evolves as
+          <code>hₜ = A hₜ₋₁ + B xₜ</code>, output <code>yₜ = C hₜ</code>. Structured SSMs (S4) made
+          this trainable at scale with a diagonal <code>A</code>. <strong>Mamba (S6)</strong>'s
+          contribution was to make <code>A, B, C</code> <strong>input-dependent</strong> ("selective")
+          — so the model can choose what to remember and what to forget per token — plus a
+          hardware-aware parallel scan to keep it fast. <strong>Mamba-2</strong> (state space duality,
+          SSD) showed SSMs and linear attention are two views of the same object, letting Mamba-2 use
+          matmul-heavy, GPU-friendly formulations.
+        </p>
+
+        <div class="code-cell" data-id="av-ssm">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">A selective (input-dependent) SSM scan</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+
+seqlen, dim = 10, 4
+x = torch.randn(seqlen, dim)
+
+# "selective": the decay a_t and input gate b_t DEPEND on x_t (a plain SSM uses fixed a,b)
+Wa, Wb, Wc = torch.randn(dim, dim) * 0.5, torch.randn(dim, dim) * 0.5, torch.randn(dim, dim) * 0.5
+h = torch.zeros(dim); y = torch.zeros(seqlen, dim)
+for t in range(seqlen):
+    a = torch.sigmoid(x[t] @ Wa)      # per-channel forget gate (input-dependent)
+    b = x[t] @ Wb                     # input projection
+    h = a * h + b * x[t]              # diagonal state update
+    y[t] = h @ Wc                     # readout
+print("output shape:", tuple(y.shape))
+print("selective = the gates adapt per token -> the model learns what to keep vs forget.")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>4. DeltaNet &amp; Gated DeltaNet</h2>
+        <p>
+          Plain linear attention <em>adds</em> <code>kv ᵀ</code> to the state — so writing the same key
+          twice makes the readouts interfere (it sums them). The <strong>delta rule</strong> (from
+          classic fast-weight / online-learning theory) fixes this: before writing, <em>predict</em>
+          the current value for the key and store only the <strong>error</strong>, so a new write for
+          an existing key <em>overwrites</em> rather than accumulates. This is much better associative
+          memory.
+        </p>
+        <div class="formula">
+          linear:&nbsp;&nbsp; Sₜ = Sₜ₋₁ + vₜkₜᵀ <br />
+          DeltaNet: Sₜ = Sₜ₋₁ + βₜ(vₜ − Sₜ₋₁kₜ)kₜᵀ = Sₜ₋₁(I − βₜkₜkₜᵀ) + βₜvₜkₜᵀ <br />
+          Gated DeltaNet: Sₜ = αₜ·Sₜ₋₁(I − βₜkₜkₜᵀ) + βₜvₜkₜᵀ &nbsp; (αₜ∈(0,1) = decay/forget)
+        </div>
+
+        <div class="code-cell" data-id="av-delta">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Delta rule overwrites; linear attention interferes</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+dim = 4
+k = torch.tensor([1.0, 0, 0, 0])          # one key (unit norm)
+v1 = torch.tensor([1.0, 2.0, 3.0, 4.0])   # first value written for k
+v2 = torch.tensor([9.0, 8.0, 7.0, 6.0])   # later OVERWRITE k with a new value
+
+# plain linear attention: state just accumulates
+S_lin = torch.zeros(dim, dim)
+S_lin += torch.outer(v1, k)
+S_lin += torch.outer(v2, k)
+print("linear attn readout for k:", (S_lin @ k).tolist(), " <- v1+v2, writes INTERFERE")
+
+# delta rule (beta=1): store the error, so a repeat write OVERWRITES
+S_del = torch.zeros(dim, dim)
+S_del += torch.outer(v1 - S_del @ k, k)
+S_del += torch.outer(v2 - S_del @ k, k)
+print("delta rule readout for k :", (S_del @ k).tolist(), " <- clean v2, update OVERWRITES")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <p>
+          <strong>Gated DeltaNet</strong> (Yang, Kautz et al., ICLR 2025 — "Improving Mamba2 with the
+          Delta Rule") adds an <em>exponential gate</em> <code>αₜ</code> for adaptive forgetting on top
+          of the delta rule, plus L2-normalized Q/K and a causal conv. It's the linear-attention layer
+          in <strong>Qwen3-Next</strong>, which interleaves it with periodic full-attention layers
+          (~every 4th layer full) — the hybrid pattern in the next section. The mental model: DeltaNet
+          gives precise error-correcting writes; the gate lets old memories decay so the fixed state
+          doesn't saturate.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>5. The zoo, briefly</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Variant</th><th>Idea</th><th>Note</th></tr></thead>
+            <tbody>
+              <tr><td>Performer / Linear Transformer</td><td>random-feature / kernel φ approximating softmax</td><td>the original linear-attention wave</td></tr>
+              <tr><td>RetNet</td><td>retention = linear attention with fixed exponential decay</td><td>parallel + recurrent + chunk forms</td></tr>
+              <tr><td>RWKV (v6/v7)</td><td>RNN-style token/channel mixing, attention-free</td><td>strong open recurrent LM line</td></tr>
+              <tr><td>GLA</td><td>gated linear attention (data-dependent decay)</td><td>precursor to Gated DeltaNet</td></tr>
+              <tr><td>Lightning Attention</td><td>IO-aware linear attention</td><td>MiniMax-01 uses it in a hybrid</td></tr>
+              <tr><td>MLA (Multi-head Latent Attn)</td><td>compress K/V to a low-rank latent</td><td>DeepSeek — shrinks KV cache, keeps softmax</td></tr>
+              <tr><td>NSA / sparse attention</td><td>attend to a learned/blocked subset</td><td>DeepSeek NSA; sub-quadratic, keeps softmax</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Note two different escape routes: linear/SSM methods <em>replace</em> softmax (sub-quadratic,
+          bounded state), while <strong>MLA</strong> and <strong>sparse attention</strong> <em>keep</em>
+          softmax but cut its cost (compress the KV cache, or attend to fewer positions). MLA in
+          particular is a big deal for inference — it keeps full-attention quality while drastically
+          shrinking the KV cache.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>6. Hybrids — where the field actually landed</h2>
+        <p>
+          Pure linear/SSM models are efficient but weaker at exact long-range retrieval (the bounded
+          state loses detail); pure softmax is expensive. The pragmatic answer that now dominates is
+          the <strong>hybrid</strong>: mostly cheap linear/SSM layers with a <em>few</em> full-attention
+          layers sprinkled in for global recall.
+        </p>
+        <ul>
+          <li><strong>Qwen3-Next / Qwen3.5</strong> — Gated DeltaNet layers with ~1-in-4 full attention.</li>
+          <li><strong>Jamba</strong> — interleaves Mamba and attention (plus MoE).</li>
+          <li><strong>MiniMax-01</strong> — Lightning (linear) attention with periodic softmax.</li>
+        </ul>
+        <p>
+          The few full-attention layers recover the retrieval the linear layers lack, while the linear
+          majority keeps inference near <code>O(T)</code> with a bounded cache. This "best of both" is
+          the current consensus — and a great thing to be able to articulate.
+        </p>
+
+        <div class="callout insight">
+          <div class="callout-title">Why this matters</div>
+          <p>
+            The framing that reads as current: it's all about the <strong>fixed-state vs KV-cache</strong>
+            trade-off. "Why not go fully linear?" → bounded state loses exact recall; benchmarks needing
+            retrieval/in-context copying suffer, which is why hybrids keep a few softmax layers. "What did
+            Mamba-2 add?" → the duality linking SSMs to attention, enabling matmul-friendly training.
+            "Why is Gated DeltaNet better than Mamba-2?" → the delta rule does error-correcting
+            (overwriting) memory updates, not just gated accumulation. "What about keeping softmax?" →
+            MLA compresses the KV cache and sparse attention prunes positions.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="av-chunk">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Exercise</span>
+            <span class="exercise-title">Chunk-parallel linear attention</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            The recurrent form is <code>O(T)</code> but serial. Real implementations use
+            <em>chunked</em> computation: within a chunk do the quadratic (parallel) form, and carry the
+            <code>d×d</code> state across chunks. Implement it: split the sequence into chunks, compute
+            intra-chunk outputs in parallel and inter-chunk contributions via the carried state, and
+            verify it matches the pure recurrent scan. This is exactly how linear-attention kernels get
+            both parallel training and <code>O(T)</code> cost.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="av-gdn">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Local exercise</span>
+            <span class="exercise-title">Gated DeltaNet layer + an associative-recall probe</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            On your machine (or extend the cells here): implement a Gated DeltaNet update with a learned
+            per-token gate <code>αₜ</code> and write-strength <code>βₜ</code>, then test it on a synthetic
+            key→value recall task (write N pairs, then query random keys). Compare recall vs plain linear
+            attention as N grows past the state dimension — you should see the delta rule + gating degrade
+            far more gracefully. Reference: FLA (flash-linear-attention) library.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) derive linear attention from softmax and show the associativity that gives
+          <code>O(T)</code> inference with a fixed state; (2) state the bounded-state-vs-KV-cache
+          trade-off; (3) explain Mamba's selectivity and Mamba-2's SSM↔attention duality; (4) write the
+          delta-rule update and explain why it overwrites where linear attention interferes; (5) place
+          Gated DeltaNet, RetNet/RWKV/GLA, MLA, and sparse attention on the map; (6) explain why hybrid
+          (linear + periodic full-attention) architectures won.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

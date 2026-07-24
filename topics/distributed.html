@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Distributed Training &amp; Parallelism · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="distributed">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Systems</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 07 · Systems</div>
+          <h1>Distributed Training &amp; Parallelism</h1>
+          <p class="lead">
+            Scaling one training job to thousands of accelerators is where LLM engineering gets
+            real. The bar: given a model and a cluster, propose a parallelism strategy and defend it
+            with memory math, collective costs, and MFU — not vibes. The runnable cells here are
+            calculators you should be able to reproduce on a whiteboard.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. Why we shard at all: the memory wall</h2>
+        <p>
+          Start every distributed discussion from memory. Training with mixed-precision Adam costs
+          roughly <strong>16 bytes per parameter</strong> for model <em>states</em> alone, before a
+          single activation:
+        </p>
+        <div class="formula">
+          fp16 params (2) + fp16 grads (2) + fp32 master params (4) + fp32 Adam m (4) + fp32 Adam v (4)
+          = <strong>16 bytes / param</strong>
+        </div>
+        <p>
+          That's the number the ZeRO paper is built around. A 7B model needs ~112 GB of state — it
+          does not fit on an 80 GB GPU, and that's before activations. Sharding is not an
+          optimization; it's a requirement.
+        </p>
+
+        <div class="code-cell" data-id="dist-mem">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Model-state memory calculator</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">def state_gb(params_b, bytes_per_param=16):
+    return params_b * 1e9 * bytes_per_param / 1e9   # GB
+
+for n in [1.5, 7, 13, 70, 405]:
+    gb = state_gb(n)
+    fits = "fits" if gb < 80 else f"needs {gb/80:.1f}x an 80GB GPU"
+    print(f"{n:6.1f}B params -> {gb:7.1f} GB model states  ({fits})")
+
+# Only the 1.5B model fits raw. Everything else forces sharding/parallelism.
+# Note: activations add MORE on top, and scale with batch*seq*layers.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <p>The four things that consume HBM, and which parallelism strategy attacks each:</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Consumer</th><th>Scales with</th><th>Sharded by</th></tr></thead>
+            <tbody>
+              <tr><td>Parameters</td><td>model size</td><td>ZeRO-3 / FSDP, TP, PP</td></tr>
+              <tr><td>Gradients</td><td>model size</td><td>ZeRO-2/3, TP, PP</td></tr>
+              <tr><td>Optimizer states</td><td>model size (biggest chunk)</td><td>ZeRO-1/2/3</td></tr>
+              <tr><td>Activations</td><td>batch × seq × layers × width</td><td>activation checkpointing, TP, SP/CP</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. The parallelism taxonomy</h2>
+
+        <h3>Data parallelism (DP)</h3>
+        <p>
+          Replicate the full model on each device, split the batch across devices, and
+          <strong>all-reduce</strong> gradients before the optimizer step. Simple and
+          communication-efficient (one all-reduce per step), but every device holds a full copy —
+          so it does nothing for the memory wall. It's the outermost layer of almost every real
+          setup.
+        </p>
+
+        <h3>ZeRO / FSDP — sharded data parallelism</h3>
+        <p>
+          The key insight of ZeRO (and PyTorch's FSDP): in plain DP the optimizer states, gradients,
+          and params are <em>redundantly</em> replicated. Shard them across the DP group instead, and
+          gather just-in-time. Three stages, increasing memory savings for increasing communication:
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Stage</th><th>Shards</th><th>Memory / device (Ψ = params)</th><th>Extra comm vs DP</th></tr></thead>
+            <tbody>
+              <tr><td>Baseline DP</td><td>nothing</td><td>16Ψ</td><td>—</td></tr>
+              <tr><td>ZeRO-1</td><td>optimizer states</td><td>4Ψ + 12Ψ/N</td><td>none (same all-reduce)</td></tr>
+              <tr><td>ZeRO-2</td><td>+ gradients</td><td>2Ψ + 14Ψ/N</td><td>none (reduce-scatter)</td></tr>
+              <tr><td>ZeRO-3 / FSDP</td><td>+ parameters</td><td>16Ψ/N</td><td>~1.5× (all-gather params fwd &amp; bwd)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          FSDP is ZeRO-3's design: params live sharded, are all-gathered per layer just before it
+          runs, then freed. This is why ZeRO-3 turns an all-reduce into an all-gather (forward) +
+          reduce-scatter (backward) — an all-reduce <em>is</em> those two, so the total volume is
+          ~1.5× DP, and it lets memory scale down with <code>N</code>.
+        </p>
+
+        <div class="code-cell" data-id="dist-zero">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">ZeRO memory per device</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">def per_device_gb(params_b, N):
+    P = params_b * 1e9
+    stages = {
+        "DP (16Ψ)":        16 * P,
+        "ZeRO-1 (4+12/N)": (4 + 12 / N) * P,
+        "ZeRO-2 (2+14/N)": (2 + 14 / N) * P,
+        "ZeRO-3 (16/N)":   (16 / N) * P,
+    }
+    return {k: v / 1e9 for k, v in stages.items()}
+
+# 70B model across 64 GPUs
+for name, gb in per_device_gb(70, 64).items():
+    print(f"{name:18s}: {gb:8.1f} GB/device  {'OK' if gb<80 else 'OOM'}")
+
+# ZeRO-3 is what makes it fit; ZeRO-1 alone already removes most of the cost.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <h3>Tensor parallelism (TP)</h3>
+        <p>
+          Split individual layers <em>across</em> devices. In a transformer, the MLP's two matmuls
+          and attention's heads shard cleanly (Megatron-LM): the first weight matrix is split
+          column-wise, the second row-wise, so only <strong>two all-reduces per layer</strong>
+          (forward + backward) are needed. TP shards params, grads, optimizer state, <em>and</em>
+          activations — but it demands very high interconnect bandwidth (each layer synchronizes), so
+          it's kept <strong>within a node</strong> (NVLink), typically TP=8.
+        </p>
+
+        <h3>Pipeline parallelism (PP)</h3>
+        <p>
+          Split the model by <em>layers</em> into stages, each on a different device; activations
+          flow forward stage-to-stage, gradients backward. The problem is the <strong>bubble</strong>:
+          while stage 1 processes micro-batch 1, stages 2–p sit idle. Splitting the batch into
+          <code>m</code> micro-batches (GPipe) and interleaving (1F1B) shrinks the bubble.
+        </p>
+        <div class="formula">
+          bubble fraction ≈ (p − 1) / (m + p − 1) &nbsp; → &nbsp; large m amortizes the idle time.
+        </div>
+
+        <div class="code-cell" data-id="dist-bubble">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Pipeline bubble</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">def bubble_fraction(p, m):
+    return (p - 1) / (m + p - 1)
+
+p = 8  # pipeline stages
+print(f"pipeline stages p={p}")
+for m in [1, 2, 4, 8, 16, 32, 64]:
+    frac = bubble_fraction(p, m)
+    print(f"  {m:3d} micro-batches -> {frac*100:5.1f}% idle  (efficiency {100*(1-frac):4.1f}%)")
+
+# rule of thumb: keep m >> p (e.g. m >= 4p) to keep the bubble small.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <h3>Sequence / context parallelism (SP/CP)</h3>
+        <p>
+          Long context makes <em>activations</em> the bottleneck (they scale with sequence length).
+          Sequence parallelism shards the sequence dimension across devices — for the parts of the
+          layer that are elementwise along the sequence (norms, dropout, the residual) — and combines
+          with TP. Context parallelism (e.g. ring attention) shards the sequence through attention
+          itself, exchanging K/V blocks between devices. This is what enables 100k+ token training.
+        </p>
+
+        <h3>Expert parallelism (EP)</h3>
+        <p>
+          For MoE models, place different experts on different devices; tokens are routed with an
+          <strong>all-to-all</strong> to their expert's device and back. EP composes with the others
+          and is why MoE scales — only the active experts' params participate per token.
+        </p>
+
+        <div class="callout insight">
+          <div class="callout-title">In practice — "3D parallelism"</div>
+          <p>
+            Real frontier runs compose these: e.g. <code>TP=8</code> within a node (NVLink),
+            <code>PP</code> across a few nodes, <code>DP/FSDP</code> across the rest. The ordering
+            matters — put the highest-bandwidth-demand parallelism (TP) on the fastest links, the
+            lowest (DP) on the slowest. Be ready to sketch this mapping for a given cluster topology.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. Collectives — the primitives underneath</h2>
+        <p>
+          Every strategy above is built from a handful of collective operations. Know what each does
+          and its cost:
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Collective</th><th>Effect</th><th>Used by</th></tr></thead>
+            <tbody>
+              <tr><td>all-reduce</td><td>every device ends with the sum of all inputs</td><td>DP gradient sync</td></tr>
+              <tr><td>reduce-scatter</td><td>sum, then each device keeps one shard</td><td>ZeRO-2/3 backward</td></tr>
+              <tr><td>all-gather</td><td>each device collects all shards</td><td>ZeRO-3/FSDP forward</td></tr>
+              <tr><td>broadcast</td><td>one device's data copied to all</td><td>init, checkpoints</td></tr>
+              <tr><td>all-to-all</td><td>each device sends a distinct chunk to each other</td><td>MoE expert routing</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          The identity to remember: <strong>all-reduce = reduce-scatter + all-gather</strong>. A
+          <strong>ring</strong> all-reduce moves ~<code>2(N−1)/N × data</code> bytes per device and is
+          bandwidth-optimal — critically, its cost is <em>independent of N</em> in the limit
+          (approaches 2×data), which is why DP scales. Tree algorithms trade bandwidth for lower
+          latency on small messages.
+        </p>
+
+        <div class="code-cell" data-id="dist-allreduce">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Ring all-reduce cost model</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">def ring_allreduce_time_ms(grad_gb, bw_gb_s, N):
+    # each device sends+receives ~2(N-1)/N * data over the ring
+    bytes_moved = 2 * (N - 1) / N * grad_gb
+    return bytes_moved / bw_gb_s * 1000
+
+# 7B params, fp16 grads = 14 GB to all-reduce each step
+grad_gb = 14
+for bw, link in [(600, "NVLink ~600 GB/s"), (50, "InfiniBand ~50 GB/s"), (12.5, "100GbE ~12.5 GB/s")]:
+    for N in [8, 64, 512]:
+        t = ring_allreduce_time_ms(grad_gb, bw, N)
+        print(f"{link:22s} N={N:4d}: {t:8.1f} ms/step")
+    print()
+# note how the time barely grows with N (the 2(N-1)/N factor saturates near 2)
+# -> bandwidth, not device count, is the limiter. Slow links kill DP.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>4. Activations &amp; recomputation</h2>
+        <p>
+          Activations stored for the backward pass often dominate memory at large batch/seq.
+          <strong>Activation checkpointing</strong> (a.k.a. gradient checkpointing / recomputation)
+          stores only layer boundaries and recomputes the intermediate activations during backward —
+          trading roughly <strong>one extra forward pass (~33% more compute)</strong> for a large
+          memory reduction. It's the standard knob when you're activation-bound.
+        </p>
+
+        <div class="code-cell" data-id="dist-actckpt">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Activation memory & the recompute trade-off</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">def activation_gb(batch, seq, layers, d_model, bytes_per=2):
+    # rough: per layer we hold O(batch*seq*d_model) activations, with a
+    # constant (~14x) for the intermediate tensors inside attention+MLP.
+    per_layer = batch * seq * d_model * 14 * bytes_per
+    return per_layer * layers / 1e9
+
+b, s, L, d = 4, 8192, 32, 4096
+full = activation_gb(b, s, L, d)
+# with full checkpointing you store ~1 layer's activations + recompute
+ckpt = activation_gb(b, s, 1, d)
+print(f"activations, no checkpointing : {full:7.1f} GB")
+print(f"activations, full checkpoint  : {ckpt:7.1f} GB  (+~33% compute)")
+print(f"memory saved                  : {full-ckpt:7.1f} GB")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. Measuring efficiency: MFU</h2>
+        <p>
+          <strong>Model FLOPs Utilization</strong> is the headline efficiency metric: the fraction of
+          peak hardware FLOP/s your run actually uses for useful model math. Training a dense
+          transformer costs ~<code>6N</code> FLOPs per token (N = params: 2 for forward, 4 for
+          backward). Good large-scale runs land around 40–55% MFU; below ~30% something is wrong
+          (comm-bound, bad overlap, small batch).
+        </p>
+        <div class="formula">
+          MFU = (6 × N × tokens_per_second) / (num_devices × peak_FLOP/s_per_device)
+        </div>
+
+        <div class="code-cell" data-id="dist-mfu">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">MFU calculator</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">def mfu(params_b, tokens_per_sec, n_devices, peak_tflops=312):
+    flops_used = 6 * params_b * 1e9 * tokens_per_sec
+    peak = n_devices * peak_tflops * 1e12
+    return flops_used / peak
+
+# 7B model on 64 A100s (312 TFLOP/s bf16), observed 200k tokens/sec
+u = mfu(7, 200_000, 64)
+print(f"MFU = {u*100:.1f}%")
+
+# invert it: what throughput do I need for 50% MFU?
+target = 0.50
+tps = target * 64 * 312e12 / (6 * 7e9)
+print(f"need {tps/1e3:.0f}k tokens/sec for 50% MFU")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="callout gotcha">
+          <div class="callout-title">⚠️ MFU vs HFU</div>
+          <p>
+            <strong>Hardware</strong> FLOPs Utilization counts <em>all</em> FLOPs executed, including
+            the recomputation from activation checkpointing; <strong>Model</strong> FLOPs Utilization
+            counts only the useful <code>6N</code> and ignores recompute. So enabling checkpointing
+            <em>raises</em> HFU but slightly <em>lowers</em> MFU (you did extra work). Quote MFU for
+            "how good is my run"; know the distinction if pressed.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>6. Putting it together — the design question</h2>
+        <p>
+          The capstone question of this whole topic is "here's a model and a cluster — how do you train it?"
+          A structured answer:
+        </p>
+        <ol>
+          <li><strong>Memory first:</strong> compute model-state GB (16Ψ) and activation GB. Does one
+            device hold it? If not, how much sharding is forced?</li>
+          <li><strong>Pick the axes:</strong> TP within a node (≤8, on NVLink); PP across a few nodes
+            if the model is too deep for TP alone; FSDP/DP across the remainder. Add SP/CP for long
+            context, EP for MoE.</li>
+          <li><strong>Check comm:</strong> estimate the all-reduce/all-gather time vs compute time per
+            step — is the collective hidden behind compute (overlap) or exposed?</li>
+          <li><strong>Tune the batch:</strong> global batch = micro-batch × grad-accum × DP-degree;
+            large enough for good MFU and to amortize the pipeline bubble, small enough to stay near
+            the critical batch size (see <a href="training-dynamics.html">Training Dynamics</a>).</li>
+          <li><strong>Measure MFU,</strong> find the bottleneck, iterate.</li>
+        </ol>
+
+        <div class="exercise" data-id="dist-design">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Exercise</span>
+            <span class="exercise-title">Plan a 70B run on 256 H100s</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Using the calculators above: a 70B dense model, 256 H100 (80 GB, ~990 bf16 TFLOP/s peak),
+            8k context. Propose TP/PP/DP degrees so it fits in memory, estimate per-step all-reduce
+            time, choose micro-batches to keep the pipeline bubble under 10%, and state a target
+            tokens/sec for 45% MFU. Write down every number and its formula.
+          </p>
+          <details class="solution">
+            <summary>Approach sketch</summary>
+            <p>
+              Model states 16×70B = 1120 GB → needs sharding across ≥14 GPUs minimum just for states.
+              A common layout: TP=8 (intra-node), PP=4, DP=8 (=256). With TP+PP the per-device param
+              shard is 70B/(8×4)=2.2B → ~35 GB states, leaving room for activations (use checkpointing
+              at 8k seq). For PP=4 keep m≥16 micro-batches → bubble = 3/(16+3) ≈ 16%; push m to 32 →
+              ~9%. Target tokens/sec for 45% MFU: 0.45 × 256 × 990e12 / (6×70e9) ≈ 271k tok/s. The
+              exact split isn't unique — the reasoning is what's graded.
+            </p>
+          </details>
+        </div>
+
+        <div class="exercise" data-id="dist-allreduce-impl">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Local exercise</span>
+            <span class="exercise-title">Verify DP gradient equivalence in PyTorch</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            On your machine (single GPU is fine, or <code>gloo</code> on CPU): show that averaging
+            gradients across two "workers" each seeing half a batch equals the gradient of the full
+            batch on one worker, to numerical tolerance. Then run it under
+            <code>torch.distributed</code> with <code>DistributedDataParallel</code> and confirm the
+            all-reduce does exactly this. Understanding <em>why</em> DP is gradient-averaging (and why
+            you divide by world size) is a frequent probe.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) derive the 16 bytes/param figure and compute model-state memory for any
+          size; (2) explain what each ZeRO stage shards and its comm cost; (3) contrast TP/PP/DP and
+          map them onto a cluster topology; (4) compute the pipeline bubble and how micro-batching
+          fixes it; (5) name the five collectives and state <code>all-reduce = reduce-scatter +
+          all-gather</code> with the ring cost; (6) explain the activation-checkpointing trade-off;
+          (7) compute MFU and distinguish it from HFU.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

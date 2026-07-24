@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Accelerators &amp; Performance · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="accelerators">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Systems</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 08 · Systems</div>
+          <h1>Accelerators &amp; Performance</h1>
+          <p class="lead">
+            The hardware you're optimizing for. Enough architecture to reason about whether a kernel is
+            good, how interconnect constrains your parallelism plan, and how to design fault
+            tolerance at a scale where hardware failure is routine.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. The GPU memory hierarchy</h2>
+        <p>
+          Performance reasoning starts with the memory pyramid. Each level up is ~an order of magnitude
+          faster and smaller. The entire game of GPU optimization is <strong>keeping data in the fast
+          levels</strong> and minimizing trips to the slow ones.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Level</th><th>Size (A100)</th><th>Bandwidth</th><th>Role</th></tr></thead>
+            <tbody>
+              <tr><td>Registers</td><td>~256 KB/SM</td><td>~fastest</td><td>per-thread scalars</td></tr>
+              <tr><td>Shared mem / L1 (SRAM)</td><td>~192 KB/SM</td><td>~19 TB/s</td><td>tile working set (FlashAttention lives here)</td></tr>
+              <tr><td>L2 cache</td><td>~40 MB</td><td>~several TB/s</td><td>cross-SM reuse</td></tr>
+              <tr><td>HBM (global)</td><td>40–80 GB</td><td>~2 TB/s</td><td>model, activations, everything</td></tr>
+              <tr><td>Host / NVLink / network</td><td>—</td><td>≤ ~0.9 TB/s</td><td>cross-device</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Execution model: threads group into <strong>warps</strong> of 32 (lockstep SIMT); warps run
+          on <strong>Streaming Multiprocessors</strong> (SMs); <strong>tensor cores</strong> do the
+          bulk matmul FLOPs. <strong>Occupancy</strong> — how many warps are resident to hide memory
+          latency — is a key tuning knob, but high occupancy alone doesn't guarantee speed.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>2. Roofline: compute-bound vs memory-bound</h2>
+        <p>
+          The one model that answers "is this kernel any good?". <strong>Arithmetic intensity</strong> =
+          FLOPs per byte moved from HBM. Compare it to the hardware's <strong>ridge point</strong>
+          (peak FLOP/s ÷ bandwidth). Below the ridge you're <em>memory-bound</em> (starved for data);
+          above it you're <em>compute-bound</em> (using the tensor cores well). Big dense matmuls are
+          compute-bound; softmax, norms, elementwise ops, and naive attention are memory-bound — which
+          is why fusion and FlashAttention (see <a href="attention.html">Attention</a>) matter.
+        </p>
+        <div class="formula">
+          attainable FLOP/s = min( peak_FLOP/s, arithmetic_intensity × bandwidth )
+        </div>
+
+        <div class="code-cell" data-id="ac-roofline">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Roofline classifier</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">peak_flops = 312e12      # A100 bf16
+bw = 2.0e12              # HBM GB/s -> bytes/s
+ridge = peak_flops / bw  # FLOP/byte at the corner
+print(f"ridge point: {ridge:.0f} FLOP/byte\n")
+
+def classify(name, flops, bytes_moved):
+    ai = flops / bytes_moved
+    attainable = min(peak_flops, ai * bw)
+    bound = "COMPUTE-bound" if ai > ridge else "MEMORY-bound"
+    print(f"{name:28s} AI={ai:7.1f} FLOP/B  -> {bound}  ({attainable/peak_flops*100:4.1f}% of peak)")
+
+# a large square matmul MxKxN
+M=K=N=8192; classify("8k^3 matmul", 2*M*K*N, 2*(M*K+K*N+M*N))
+# elementwise add of two big tensors: 1 FLOP per 3*4 bytes touched
+n=1e9; classify("elementwise add", n, 3*4*n)
+# softmax over a big row: ~5 FLOP/elt, read+write
+classify("softmax (memory-bound)", 5*n, 2*4*n)</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. Interconnect — it dictates your parallelism plan</h2>
+        <p>
+          Which parallelism goes where is a direct function of link bandwidth (revisit the mapping on
+          <a href="distributed.html">Distributed Training</a>). The hierarchy:
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Link</th><th>~Bandwidth</th><th>Scope</th><th>Carries</th></tr></thead>
+            <tbody>
+              <tr><td>NVLink / NVSwitch</td><td>~400–900 GB/s</td><td>within a node (8 GPUs)</td><td>tensor parallelism (chatty, per-layer)</td></tr>
+              <tr><td>InfiniBand</td><td>~25–50 GB/s/link</td><td>across nodes</td><td>pipeline &amp; data parallel</td></tr>
+              <tr><td>Ethernet</td><td>~12 GB/s (100GbE)</td><td>across nodes (cheaper)</td><td>data parallel if you must</td></tr>
+              <tr><td>PCIe</td><td>~32–64 GB/s</td><td>host↔device</td><td>data loading, offload</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          The rule that falls out: put the <em>highest-communication</em> parallelism (TP, which syncs
+          twice per layer) on the <em>fastest</em> link (NVLink, intra-node), and the
+          <em>lowest</em> (DP, one all-reduce per step) on the slowest. Getting this backwards is a
+          common wrong answer.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>4. Non-NVIDIA accelerators: TPU &amp; the compiler model</h2>
+        <p>
+          Several frontier labs train primarily on TPUs (or AWS Trainium), so know the shape of it. A TPU is a
+          systolic-array matmul engine with large <strong>MXU</strong>s, connected in a 2D/3D torus
+          <strong>pod</strong> with very high-bandwidth inter-chip links (ICI) — designed for exactly
+          the collective-heavy communication of training. The big conceptual shift is the
+          <strong>compiler-centric</strong> model: you express computation in JAX/XLA, and
+          <strong>XLA</strong> compiles the whole graph ahead of time — fusing ops, choosing layouts,
+          and inserting collectives — rather than eager op-by-op execution. This means shapes must be
+          static, and performance work is about helping the compiler (fusion, sharding annotations via
+          GSPMD) rather than hand-writing kernels.
+        </p>
+        <div class="callout insight">
+          <div class="callout-title">Why this matters</div>
+          <p>
+            "What changes moving from GPU/PyTorch-eager to TPU/JAX-XLA?" — static shapes (no
+            data-dependent control flow without care), whole-program compilation and fusion, sharding
+            expressed declaratively and lowered to collectives by the compiler, and a first
+            compilation cost you pay once. The mental model flips from "I place and tune kernels" to "I
+            shape the program so the compiler can."
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. Fault tolerance — failure as the steady state</h2>
+        <p>
+          At thousands of accelerators, hardware failure is not an edge case — it's the steady state. If
+          one chip fails every few years on average, a run with thousands of chips sees failures every
+          few <em>hours</em>. Your training system must expect and absorb this.
+        </p>
+
+        <div class="code-cell" data-id="ac-mtbf">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Failures are routine at scale</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">def system_mtbf_hours(per_chip_mtbf_years, n_chips):
+    per_chip_hours = per_chip_mtbf_years * 365 * 24
+    return per_chip_hours / n_chips        # failures compound with chip count
+
+for n in [8, 512, 4096, 16384]:
+    m = system_mtbf_hours(5.0, n)          # assume 5-year per-chip MTBF
+    print(f"{n:6d} chips: expect a failure every {m:7.1f} h  (~{m/24:.2f} days)")
+
+# a month-long 16k-chip run will see HUNDREDS of failures -> auto-recovery is mandatory.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <p>The toolkit, and the trade-offs to discuss:</p>
+        <ul>
+          <li><strong>Checkpointing</strong> — the backbone. Save weights + optimizer state + RNG +
+            dataloader position often enough that a failure costs little recompute, but not so often that
+            I/O dominates. <strong>Async</strong> checkpointing (copy to host, write in background) and
+            <strong>sharded</strong> checkpointing (each rank writes its shard) hide the cost.</li>
+          <li><strong>Optimal interval</strong> — the Young/Daly result: checkpoint every
+            <code>√(2 · checkpoint_time · MTBF)</code> to minimize total wasted time. Too frequent wastes
+            I/O; too rare wastes recompute after a crash.</li>
+          <li><strong>Elastic / auto-restart</strong> — detect the dead node, reschedule (Kubernetes,
+            see <a href="infra-tooling.html">Infra &amp; Tooling</a>), reload the last checkpoint, and
+            continue past the point of failure.</li>
+          <li><strong>Stragglers</strong> — a slow (not dead) node bottlenecks every collective; detect
+            via per-step timing outliers and evict.</li>
+        </ul>
+
+        <div class="code-cell" data-id="ac-checkpoint">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Young/Daly optimal checkpoint interval</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import math
+
+def optimal_interval_and_waste(ckpt_time_s, mtbf_s):
+    tau = math.sqrt(2 * ckpt_time_s * mtbf_s)        # Young/Daly optimal interval
+    overhead = ckpt_time_s / tau                     # fraction spent checkpointing
+    lost = (tau / 2) / mtbf_s                         # avg lost work per failure interval
+    return tau, overhead + lost
+
+mtbf_s = 4 * 3600           # a failure every 4 hours (large run)
+for ckpt_time in [30, 120, 600]:
+    tau, waste = optimal_interval_and_waste(ckpt_time, mtbf_s)
+    print(f"checkpoint takes {ckpt_time:4d}s -> checkpoint every {tau/60:5.1f} min, ~{waste*100:.1f}% time wasted")
+# faster checkpoints (async/sharded) -> checkpoint more often -> less lost work on crash.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <div class="exercise" data-id="ac-ft-design">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Exercise</span>
+            <span class="exercise-title">Design fault tolerance for a 10k-GPU, month-long run</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Using the calculators: estimate how many failures to expect, choose a checkpoint interval
+            (Young/Daly) given a realistic sharded-async checkpoint time, and describe the end-to-end
+            recovery path — detection, rescheduling, reload, resume-past-failure, and how you avoid
+            re-consuming the same data. What monitoring tells you a node is a straggler vs dead?
+          </p>
+        </div>
+
+        <div class="exercise" data-id="ac-profile">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Local exercise</span>
+            <span class="exercise-title">Profile a kernel and place it on the roofline</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            On your machine: profile a matmul and a softmax/layernorm with the PyTorch profiler (or
+            nsight). Measure achieved FLOP/s and bytes moved, compute arithmetic intensity, and confirm
+            the matmul is compute-bound while the softmax is memory-bound. Then fuse or use a fused
+            kernel and watch the memory-bound op speed up — the roofline made concrete.
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Checklist before you call this "sharp"</div>
+          <p>You can: (1) sketch the GPU memory hierarchy and explain warps/SMs/tensor cores/occupancy;
+          (2) compute arithmetic intensity and classify a kernel via the roofline; (3) map
+          TP/PP/DP onto NVLink/IB/Ethernet and justify it; (4) explain the TPU/XLA compiler model and
+          what changes vs eager GPU; (5) argue why failures are routine at scale and design
+          checkpointing (async/sharded, Young/Daly interval) plus elastic restart and straggler
+          detection.</p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

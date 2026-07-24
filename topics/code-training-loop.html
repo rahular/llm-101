@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The Training Loop (code) · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="code-training-loop">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Code</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 19 · Code</div>
+          <h1>The Training Loop</h1>
+          <p class="lead">
+            Everything around the model: batching, the AdamW parameter groups, warmup+cosine LR,
+            gradient accumulation, mixed-precision autocast, gradient clipping, checkpointing, and
+            generation. The concepts live on <a href="training-dynamics.html">Training Dynamics</a> and
+            <a href="numerics-precision.html">Numerics</a>; this is the code that ties them together.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. Batching</h2>
+        <p>
+          Data is one long 1-D tensor of token ids. Sample random windows; the target is the input
+          shifted by one (next-token prediction).
+        </p>
+        <div class="code-view" data-file="train.py">
+<script type="text/x-python">
+import math
+import torch
+
+def get_batch(data, seqlen, batch_size, device):
+    ix = torch.randint(len(data) - seqlen, (batch_size,))             # random start indices
+    x = torch.stack([data[i:i + seqlen] for i in ix])                # (batch, seqlen) inputs
+    y = torch.stack([data[i + 1:i + 1 + seqlen] for i in ix])        # (batch, seqlen) targets = shift by 1
+    return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+</script>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. Optimizer with weight-decay groups</h2>
+        <p>
+          A detail that matters: decay the 2D matrices (Linears, embeddings) but <em>not</em> the 1D
+          params (norm gains, biases). Two param groups, one AdamW. Use <code>fused=True</code> on CUDA
+          for a faster step.
+        </p>
+        <div class="code-view" data-file="train.py">
+<script type="text/x-python">
+def configure_optimizer(model, weight_decay, lr, betas=(0.9, 0.95)):
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        # weight matrices (dim >= 2) get decay; norms/biases (dim < 2) do not
+        (decay if p.dim() >= 2 else no_decay).append(p)
+    groups = [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    return torch.optim.AdamW(groups, lr=lr, betas=betas, eps=1e-8, fused=True)
+</script>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>3. Learning-rate schedule</h2>
+        <p>Linear warmup, then cosine decay to a floor. The reference schedule from every LLM recipe.</p>
+        <div class="code-view" data-file="train.py">
+<script type="text/x-python">
+def get_lr(step, warmup, max_steps, max_lr, min_lr):
+    if step < warmup:                                    # 1) linear warmup from 0
+        return max_lr * (step + 1) / warmup
+    if step > max_steps:                                 # 2) after schedule: hold the floor
+        return min_lr
+    ratio = (step - warmup) / (max_steps - warmup)       # 3) cosine decay in [0, 1]
+    coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))      # 1 -> 0
+    return min_lr + coeff * (max_lr - min_lr)
+</script>
+        </div>
+
+        <div class="code-cell" data-id="ctl-lr">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">See the schedule (PyTorch)</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import math
+def get_lr(step, warmup, max_steps, max_lr, min_lr):
+    if step < warmup: return max_lr * (step + 1) / warmup
+    if step > max_steps: return min_lr
+    r = (step - warmup) / (max_steps - warmup)
+    return min_lr + 0.5 * (1 + math.cos(math.pi * r)) * (max_lr - min_lr)
+
+for s in [0, 100, 200, 500, 2000, 5000, 9000, 10000]:
+    print(f"step {s:5d}: lr = {get_lr(s, 200, 10000, 6e-4, 6e-5):.2e}")
+# rises linearly to peak at step 200, then cosine-decays to the 6e-5 floor.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>4. Evaluation</h2>
+        <p>Average loss over a few batches, under <code>no_grad</code> and <code>eval</code> mode.</p>
+        <div class="code-view" data-file="train.py">
+<script type="text/x-python">
+@torch.no_grad()
+def estimate_loss(model, data, seqlen, batch_size, device, iters=50):
+    model.eval()
+    losses = torch.zeros(iters)
+    for i in range(iters):
+        x, y = get_batch(data, seqlen, batch_size, device)
+        _, loss = model(x, y)
+        losses[i] = loss.item()
+    model.train()
+    return losses.mean()
+</script>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. The loop</h2>
+        <p>
+          The whole thing: set the step's LR, accumulate gradients over several micro-batches under
+          <strong>bf16 autocast</strong>, clip the global gradient norm, step, and periodically eval +
+          checkpoint. bf16 needs no <code>GradScaler</code> (its range is wide enough — see
+          <a href="numerics-precision.html">Numerics</a>); fp16 would.
+        </p>
+        <div class="code-view" data-file="train.py">
+<script type="text/x-python">
+model = LlamaModel(cfg).to(device)
+opt = configure_optimizer(model, weight_decay=0.1, lr=6e-4)
+grad_accum = 8            # effective batch = batch_size * grad_accum * data-parallel world size
+max_steps, warmup = 10000, 200
+
+for step in range(max_steps):
+    lr = get_lr(step, warmup, max_steps, max_lr=6e-4, min_lr=6e-5)
+    for g in opt.param_groups:
+        g["lr"] = lr
+
+    opt.zero_grad(set_to_none=True)
+    for _ in range(grad_accum):                                  # gradient accumulation
+        x, y = get_batch(train_data, cfg.max_seqlen, batch_size, device)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, loss = model(x, y)
+        (loss / grad_accum).backward()                           # average the micro-batch grads
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)      # global-norm clip (stability)
+    opt.step()
+
+    if step % 500 == 0:
+        val = estimate_loss(model, val_data, cfg.max_seqlen, batch_size, device)
+        print(f"step {step}: val loss {val:.4f}  lr {lr:.2e}")
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                    "step": step, "cfg": cfg}, "ckpt.pt")         # resumable checkpoint
+</script>
+        </div>
+        <div class="callout gotcha">
+          <div class="callout-title">⚠️ A resumable checkpoint needs more than weights</div>
+          <p>
+            To resume <em>exactly</em>, the checkpoint must also carry the optimizer state (Adam's
+            moments), the step count (so the LR schedule continues), and ideally the RNG + dataloader
+            position. Saving only <code>model.state_dict()</code> restarts momentum and the schedule —
+            see <a href="infra-tooling.html">Infra &amp; Tooling §2</a>.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>6. Generation</h2>
+        <p>
+          Autoregressive sampling with temperature and top-k. Note it re-runs the whole context each
+          step — correct but <code>O(T²)</code>; production caches K/V (see
+          <a href="attention.html">Attention §5</a>).
+        </p>
+        <div class="code-view" data-file="generate.py">
+<script type="text/x-python">
+@torch.no_grad()
+def generate(model, idx, max_new_tokens, temperature=1.0, top_k=None):
+    model.eval()
+    for _ in range(max_new_tokens):
+        idx_cond = idx[:, -model.cfg.max_seqlen:]        # crop to the context window
+        logits, _ = model(idx_cond)
+        logits = logits[:, -1, :] / temperature          # only the last position matters
+        if top_k is not None:
+            v, _ = torch.topk(logits, top_k)
+            logits[logits < v[:, [-1]]] = float('-inf')  # keep only the top-k tokens
+        probs = F.softmax(logits, dim=-1)
+        next_id = torch.multinomial(probs, num_samples=1)
+        idx = torch.cat([idx, next_id], dim=1)           # append and repeat
+    return idx
+</script>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Reading checklist</div>
+          <p>
+            You can explain: why weight-decay is split by param dimensionality; why <code>zero_grad</code>
+            is once per accumulation window and the loss is divided by <code>grad_accum</code>; why bf16
+            autocast needs no scaler; what global-norm clipping does; and what a checkpoint must contain
+            to resume. Each links to a concept page if it's fuzzy.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="ctl-resume">
+          <div class="exercise-head">
+            <span class="exercise-badge med">Local exercise</span>
+            <span class="exercise-title">Prove your checkpoint resumes correctly</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Train 100 steps, checkpoint, and continue to 200. Separately, train straight through to 200
+            with the same seed. Confirm the loss curves match after resume (within seed noise). Then
+            deliberately drop the optimizer state from the checkpoint and watch the loss bump at resume —
+            the momentum-reset failure mode made visible.
+          </p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>

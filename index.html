@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LLM Internals</title>
+  <link rel="stylesheet" href="assets/css/style.css?v=8" />
+</head>
+<body>
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="hero">
+          <div class="eyebrow">The nitty-gritties of large language models</div>
+          <h1>How modern LLMs are actually built.</h1>
+          <p class="lead">
+            A hands-on reading course on the internals of large language models — from tensor
+            shapes to trillion-parameter training runs. Each page goes deep on one topic, with
+            runnable PyTorch cells (real torch, via a local kernel) and exercises you can check
+            off. Covers the full stack: architecture, training science, distributed systems,
+            data, post-training, and case studies of frontier open models.
+          </p>
+          <div class="progress-bar-wrap">
+            <div class="progress-bar"><span></span></div>
+            <div class="progress-label"></div>
+          </div>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">How to use this</div>
+          <p>
+            Read in order, or jump to what interests you — the <strong>start here</strong>
+            pages are the foundations everything else builds on. Every topic is a full deep
+            dive: edit the code cells and hit <span class="kbd">⌘/Ctrl + Enter</span> to run,
+            and check off exercises as you go. Your edits and progress persist locally in this
+            browser. Each page ends with a self-assessment checklist.
+          </p>
+          <p>
+            The cells run <strong>real PyTorch</strong> on a small local kernel. Start it once from
+            the project root — <code>python3 kernel/server.py</code> — and the status pill in the
+            bottom-right corner turns green. Until then, cells stay editable but won't execute.
+          </p>
+        </div>
+
+        <h2>Topics</h2>
+        <div id="topic-grid" class="topic-grid"></div>
+
+        <hr class="soft" />
+        <h2>The idea behind the pages</h2>
+        <p>
+          Working on LLMs draws on four kinds of fluency: <strong>(1) practical ML coding</strong>
+          — writing and debugging real model and training code; <strong>(2) ML &amp; systems
+          depth</strong> — architecture, training dynamics, distributed systems, numerics;
+          <strong>(3) experiment design</strong> — "loss spiked / eval regressed, what now?"; and
+          <strong>(4) reading the field</strong> — knowing what frontier labs actually do and why.
+          The pages are organized around exactly these four, with runnable code wherever a claim
+          can be demonstrated rather than asserted.
+        </p>
+        <p class="footnote">
+          Content is written from first principles and cross-checked against primary sources
+          (papers, framework docs). Where a claim is subtle, the page links the source.
+        </p>
+      </main>
+    </div>
+  </div>
+
+  <script src="assets/js/kernel-runner.js?v=8"></script>
+  <script src="assets/js/site.js?v=8"></script>
+</body>
+</html>

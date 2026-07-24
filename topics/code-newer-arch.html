@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Newer Architectures (code) · LLM Internals</title>
+  <link rel="stylesheet" href="../assets/css/style.css?v=8" />
+</head>
+<body data-topic="code-newer-arch">
+  <button class="menu-toggle" aria-label="Menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="../index.html">
+        <div class="brand-title">LLM Internals</div>
+        <div class="brand-sub">How modern language models are built</div>
+      </a>
+      <nav id="nav"></nav>
+    </aside>
+
+    <div class="content-wrap">
+      <main class="content">
+        <div class="crumb"><a href="../index.html">Home</a> · Code</div>
+        <div class="page-head">
+          <div class="eyebrow">Topic 20 · Code</div>
+          <h1>Newer Architectures</h1>
+          <p class="lead">
+            Drop-in code for the modern upgrades: <strong>GQA</strong> (cheaper KV cache),
+            <strong>MoE</strong> (more params, same FLOPs), a <strong>MLA</strong> sketch, sliding-window
+            attention, and the <strong>Muon</strong> optimizer. Concepts are on
+            <a href="attention-variants.html">Attention Variants</a> and
+            <a href="optimizer-frontier.html">Optimizer Frontier</a>; here is code you can drop into the
+            <a href="code-rope-modern.html">Llama-style block</a>.
+          </p>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>1. Grouped-query attention (GQA)</h2>
+        <p>
+          Fewer K/V heads than Q heads, each shared across a group of query heads — shrinking the KV
+          cache by <code>n_heads / n_kv_heads</code>× at almost no quality cost. The only new piece is
+          <code>repeat_kv</code>, which broadcasts each KV head to its group before the attention matmul.
+        </p>
+        <div class="code-view" data-file="gqa.py">
+<script type="text/x-python">
+def repeat_kv(x, n_rep):
+    # x: (batch, n_kv_heads, seqlen, head_dim) -> (batch, n_kv_heads*n_rep, seqlen, head_dim)
+    if n_rep == 1:
+        return x
+    batch, n_kv_heads, seqlen, head_dim = x.shape
+    return (x[:, :, None, :, :]
+            .expand(batch, n_kv_heads, n_rep, seqlen, head_dim)
+            .reshape(batch, n_kv_heads * n_rep, seqlen, head_dim))
+
+class GQAttention(nn.Module):
+    def __init__(self, d_model, n_heads, n_kv_heads):
+        super().__init__()
+        assert n_heads % n_kv_heads == 0
+        self.n_heads, self.n_kv_heads = n_heads, n_kv_heads
+        self.n_rep = n_heads // n_kv_heads
+        self.head_dim = d_model // n_heads
+        self.wq = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)   # smaller K proj
+        self.wv = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)   # smaller V proj
+        self.wo = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
+
+    def forward(self, x):
+        batch, seqlen, d_model = x.shape
+        q = self.wq(x).view(batch, seqlen, self.n_heads, self.head_dim).transpose(1, 2)     # (batch, n_heads, seqlen, head_dim)
+        k = self.wk(x).view(batch, seqlen, self.n_kv_heads, self.head_dim).transpose(1, 2)  # (batch, n_kv_heads, ...)
+        v = self.wv(x).view(batch, seqlen, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        k, v = repeat_kv(k, self.n_rep), repeat_kv(v, self.n_rep)        # share KV to groups
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.wo(y.transpose(1, 2).contiguous().view(batch, seqlen, d_model))
+</script>
+        </div>
+
+        <div class="code-cell" data-id="cna-gqa">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Verify KV sharing (PyTorch)</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+
+def repeat_kv(x, n_rep):        # x: (n_kv_heads, seqlen, head_dim)
+    if n_rep == 1:
+        return x
+    n_kv_heads, seqlen, head_dim = x.shape
+    return x[:, None].expand(n_kv_heads, n_rep, seqlen, head_dim).reshape(n_kv_heads * n_rep, seqlen, head_dim)
+
+n_heads, n_kv_heads, seqlen, head_dim = 8, 2, 3, 4
+k = torch.arange(n_kv_heads * seqlen * head_dim).reshape(n_kv_heads, seqlen, head_dim)
+kr = repeat_kv(k, n_heads // n_kv_heads)
+print("KV heads:", n_kv_heads, "-> query heads:", kr.shape[0], f"(each KV shared {n_heads//n_kv_heads}x)")
+print("head0 == head1 == head2 == head3:", torch.equal(kr[0], kr[3]))
+print("head4 belongs to the 2nd KV group:", torch.equal(kr[4], k[1]))
+# KV cache is n_kv_heads/n_heads the size of full MHA -> the whole point of GQA.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>2. Mixture of Experts (MoE)</h2>
+        <p>
+          Replace the single MLP with <code>E</code> experts and a router that sends each token to its
+          top-<code>k</code>. Total params scale with <code>E</code>; per-token FLOPs scale with
+          <code>k</code>. The <strong>load-balancing auxiliary loss</strong> keeps the router from
+          collapsing onto a few experts (<a href="transformer-internals.html">Transformer Internals §7</a>).
+        </p>
+        <div class="code-view" data-file="moe.py">
+<script type="text/x-python">
+class MoE(nn.Module):
+    def __init__(self, d_model, n_experts=8, top_k=2, hidden=None):
+        super().__init__()
+        hidden = hidden or 4 * d_model
+        self.n_experts, self.top_k = n_experts, top_k
+        self.router = nn.Linear(d_model, n_experts, bias=False)
+        self.experts = nn.ModuleList([
+            nn.Sequential(nn.Linear(d_model, hidden, bias=False), nn.GELU(),
+                          nn.Linear(hidden, d_model, bias=False))
+            for _ in range(n_experts)
+        ])
+
+    def forward(self, x):
+        batch, seqlen, d_model = x.shape
+        x = x.reshape(-1, d_model)                            # (N, d_model) flatten tokens
+        probs = F.softmax(self.router(x), dim=-1)            # (N, E) routing weights
+        weights, idx = probs.topk(self.top_k, dim=-1)        # (N, k) top-k experts per token
+        weights = weights / weights.sum(-1, keepdim=True)    # renormalize the kept weights
+
+        out = torch.zeros_like(x)
+        for e, expert in enumerate(self.experts):
+            token_mask = (idx == e).any(dim=-1)              # which tokens picked expert e
+            if token_mask.any():
+                w = (weights * (idx == e)).sum(-1)[token_mask]   # their weight for e
+                out[token_mask] += w.unsqueeze(-1) * expert(x[token_mask])
+
+        # Switch-style load-balancing aux loss: encourage uniform expert usage
+        importance = probs.mean(0)                            # mean router prob per expert
+        load = torch.zeros(self.n_experts, device=x.device)
+        load.scatter_add_(0, idx.reshape(-1), torch.ones(idx.numel(), device=x.device))
+        load = load / load.sum()
+        aux_loss = self.n_experts * (importance * load).sum()
+        return out.reshape(batch, seqlen, d_model), aux_loss
+</script>
+        </div>
+        <p class="footnote">
+          Real MoE adds capacity factors / dropless routing and spreads experts across devices with
+          <strong>expert parallelism</strong> and an all-to-all (<a href="distributed.html">Distributed
+          §2</a>). Add <code>aux_loss</code> (times a small coefficient) to the training loss.
+        </p>
+
+        <!-- ========================================================= -->
+        <h2>3. Multi-head Latent Attention (MLA) — sketch</h2>
+        <p>
+          DeepSeek's trick to shrink the KV cache while keeping softmax attention: project K/V down to a
+          small <em>latent</em> <code>c_kv</code>, <strong>cache only that</strong>, and up-project when
+          needed. The cache stores <code>d_latent</code> per token instead of <code>2·n_heads·head_dim</code>.
+        </p>
+        <div class="code-view" data-file="mla.py">
+<script type="text/x-python">
+class MLA(nn.Module):
+    def __init__(self, d_model, n_heads, d_latent):
+        super().__init__()
+        self.n_heads, self.head_dim = n_heads, d_model // n_heads
+        self.wq = nn.Linear(d_model, d_model, bias=False)
+        self.w_dkv = nn.Linear(d_model, d_latent, bias=False)   # down-project to the latent
+        self.w_uk = nn.Linear(d_latent, d_model, bias=False)    # up-project keys
+        self.w_uv = nn.Linear(d_latent, d_model, bias=False)    # up-project values
+        self.wo = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x):
+        batch, seqlen, d_model = x.shape
+        c_kv = self.w_dkv(x)              # (batch, seqlen, d_latent) <- cache THIS (small)
+        q = self.wq(x)
+        k, v = self.w_uk(c_kv), self.w_uv(c_kv)   # reconstruct full K, V on the fly
+        split = lambda t: t.view(batch, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        y = F.scaled_dot_product_attention(split(q), split(k), split(v), is_causal=True)
+        return self.wo(y.transpose(1, 2).contiguous().view(batch, seqlen, d_model))
+</script>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>4. Sliding-window attention</h2>
+        <p>
+          Bound the cost of long context: each position attends only to itself and the previous
+          <code>window − 1</code> tokens (Mistral). Just a different mask.
+        </p>
+        <div class="code-view" data-file="swa.py">
+<script type="text/x-python">
+def sliding_window_mask(T, window, device=None):
+    i = torch.arange(T, device=device)
+    causal = i[:, None] >= i[None, :]              # no attending to the future
+    within = (i[:, None] - i[None, :]) < window    # within the window
+    return causal & within                         # (T, T) boolean; pass as attn_mask to SDPA
+</script>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>5. The Muon optimizer</h2>
+        <p>
+          Momentum orthogonalized by Newton–Schulz — for 2D weight matrices only (embeddings, the head,
+          and norms stay on AdamW). See <a href="optimizer-frontier.html">Optimizer Frontier §4</a> for
+          the why; here is a compact implementation.
+        </p>
+        <div class="code-view" data-file="muon.py">
+<script type="text/x-python">
+def zeropower_via_newtonschulz(G, steps=5):
+    # approximate the orthogonal factor UVᵀ of G via a tuned quintic (run in bf16)
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.bfloat16()
+    X = X / (X.norm() + 1e-7)                       # normalize: largest singular value <= 1
+    if X.size(0) > X.size(1):
+        X = X.T                                     # iterate on the smaller dimension
+    for _ in range(steps):
+        A = X @ X.T
+        X = a * X + (b * A + c * A @ A) @ X
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X.to(G.dtype)
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, momentum=0.95, weight_decay=0.0):
+        super().__init__(params, dict(lr=lr, momentum=momentum, weight_decay=weight_decay))
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if "m" not in state:
+                    state["m"] = torch.zeros_like(p.grad)
+                m = state["m"]
+                m.mul_(group["momentum"]).add_(p.grad)          # momentum buffer
+                update = zeropower_via_newtonschulz(m)          # orthogonalize the update
+                scale = max(p.size(0), p.size(1)) ** 0.5        # match AdamW's effective step
+                p.mul_(1 - group["lr"] * group["weight_decay"]) # decoupled weight decay
+                p.add_(update, alpha=-group["lr"] * scale)      # take the step
+</script>
+        </div>
+        <div class="callout gotcha">
+          <div class="callout-title">⚠️ Muon is 2D-only — route parameters</div>
+          <p>
+            Give Muon only the weight matrices; put embeddings, the LM head, and norm/bias params in a
+            separate AdamW optimizer. A "Muon run" is always Muon + AdamW
+            (<a href="optimizer-frontier.html">Optimizer Frontier §4</a>).
+          </p>
+        </div>
+
+        <div class="callout insight">
+          <div class="callout-title">Reading checklist</div>
+          <p>
+            You can explain and modify each: <code>repeat_kv</code> and why GQA shrinks the cache; the
+            MoE router + top-k dispatch + aux loss; what MLA caches instead of full K/V; the
+            sliding-window mask; and Muon's momentum → Newton–Schulz → scaled step, plus why it only
+            takes 2D params.
+          </p>
+        </div>
+
+        <div class="exercise" data-id="cna-swap">
+          <div class="exercise-head">
+            <span class="exercise-badge hard">Local exercise</span>
+            <span class="exercise-title">Upgrade the Llama model to GQA + MoE + Muon</span>
+            <label class="exercise-done-toggle"><input type="checkbox" /> done</label>
+          </div>
+          <p>
+            Start from <a href="code-rope-modern.html">the RoPE model</a>: swap its attention for
+            <code>GQAttention</code>, replace the SwiGLU with <code>MoE</code> (add the aux loss to the
+            training loss), and train it with <code>Muon</code> (2D params) + <code>AdamW</code> (the
+            rest). Compare tokens-to-loss and parameter count against the dense baseline. This assembles
+            most of a modern frontier model from the pieces on this page.
+          </p>
+        </div>
+
+        <div id="pager"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="../assets/js/kernel-runner.js?v=8"></script>
+  <script src="../assets/js/site.js?v=8"></script>
+</body>
+</html>
