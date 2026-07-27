@@ -204,14 +204,155 @@ print("   of UVᵀ). Every direction of the update gets ~equal scale, none domin
             effectively conditioning the update without a full second-order inverse. Empirically it reaches
             a target loss in fewer tokens — Moonshot's scaling-law study reported roughly <strong>2×
             compute efficiency vs AdamW</strong>, and Muon powered <strong>Kimi K2</strong> (~1T-param MoE,
-            32B active). The two tricks that made it scale: <strong>add weight decay</strong>, and
-            <strong>tune the per-parameter update scale</strong> (e.g. ∝ √max(m,n)) so it matches AdamW's
-            effective step. Stability add-on at scale: <strong>QK-clip</strong> for attention logits.
+            32B active, 15.5T tokens). But it does not work out of the box at scale: the next two
+            sections are the recipe and the stability guard that make it production-grade.
           </p>
         </div>
 
         <!-- ========================================================= -->
-        <h2>5. Choosing — the comparison</h2>
+        <h2>5. The practical recipe — making Muon actually work</h2>
+        <p>
+          The published playbook, converged across Jordan's original repo, Moonshot's Moonlight/K2
+          reports, and independent pretraining studies:
+        </p>
+        <ul>
+          <li><strong>Route parameters correctly.</strong> Muon takes 2D weight matrices only
+            (attention projections, MLP weights). Embeddings, the LM head, RMSNorm gains, and biases go
+            to AdamW — they're per-element objects where orthogonalization is meaningless. Every real
+            "Muon run" is a Muon+AdamW hybrid with two param groups.</li>
+          <li><strong>Match AdamW's update RMS with the scale rule.</strong> A raw orthogonalized update
+            has RMS <code>≈ 1/√max(m,n)</code> — it shrinks with matrix size, so different layers would
+            take wildly different effective steps. Multiplying the update by
+            <code>0.2·√max(m,n)</code> normalizes every matrix's update RMS to ~0.2, which is roughly
+            AdamW's typical update RMS. This is the single most practical trick: it makes Muon's
+            learning rate <em>directly transplantable from an AdamW config</em>, and it's why Moonshot
+            could claim Muon works "out of the box" with their AdamW hyperparameters.</li>
+          <li><strong>Weight decay is not optional.</strong> Early small-scale Muon skipped it; at scale,
+            unconstrained weight growth eventually hurts both stability and quality. K2 used
+            <code>λ = 0.1</code> (decoupled, exactly as in AdamW) throughout. Moonlight's ablation calls
+            weight decay one of the two changes that made Muon scale at all.</li>
+          <li><strong>Standard knobs</strong>: momentum <code>μ = 0.95</code> with Nesterov, 5
+            Newton–Schulz steps, NS run in <strong>bf16</strong> (it's robust to low precision — the
+            iteration only needs to land singular values <em>near</em> 1, not exactly). K2's schedule:
+            LR 2e-4 held constant for 10T tokens, then cosine to 2e-5.</li>
+          <li><strong>Large-batch behavior is a feature.</strong> Independent pretraining studies
+            (Essential AI) find Muon stays data-efficient at larger batch sizes than AdamW — its
+            critical batch size is higher — which buys flexibility in how you parallelize a run
+            (<a href="training-dynamics.html">Training Dynamics §5</a>).</li>
+          <li><strong>Fine-tuning is the caveat.</strong> Applying Muon to an <em>AdamW-pretrained</em>
+            checkpoint gives mixed results — the optimizer state and the loss-landscape geometry the
+            weights settled into "belong" to Adam. Muon's wins are cleanest when it runs from
+            initialization.</li>
+        </ul>
+
+        <!-- ========================================================= -->
+        <h2>6. QK-clip — the stability guard that completes MuonClip</h2>
+        <p>
+          Scaling Muon exposed a failure mode AdamW mostly avoids: <strong>exploding attention
+          logits</strong>. The intuition follows from Muon's own design. AdamW's second-moment
+          normalization automatically damps parameters with consistently large gradients; Muon
+          deliberately removes that damping — every direction of the update gets full, equal
+          magnitude. If some attention head's <code>W_q, W_k</code> are drifting toward producing huge
+          <code>q·k</code> logits, Muon keeps pushing them there at full strength. Left alone, logits
+          blow past ~1000, softmax saturates, and the loss spikes
+          (<a href="training-dynamics.html">Training Dynamics §3</a>).
+        </p>
+        <p>
+          <strong>QK-clip</strong> (the "Clip" in K2's MuonClip) bounds this <em>at the weights, per
+          head, after each optimizer step</em>:
+        </p>
+        <div class="formula">
+          For each head h: track S<sub>max</sub><sup>h</sup> = max attention logit this step. <br />
+          γ<sub>h</sub> = min(1, τ / S<sub>max</sub><sup>h</sup>) &nbsp;&nbsp;→&nbsp;&nbsp;
+          W_q<sup>h</sup> ← √γ<sub>h</sub>·W_q<sup>h</sup>, &nbsp; W_k<sup>h</sup> ← √γ<sub>h</sub>·W_k<sup>h</sup>
+          &nbsp;&nbsp; (τ = 100 in K2)
+        </div>
+        <p>
+          Since the logit is bilinear in <code>W_q</code> and <code>W_k</code>, scaling each by
+          <code>√γ</code> scales the head's max logit by exactly <code>γ</code> — pinning it to τ.
+          Details that matter in practice:
+        </p>
+        <ul>
+          <li><strong>Per-head, not global.</strong> Only a small subset of heads ever explode; a global
+            rescale would punish the healthy ones. Clip only the offenders.</li>
+          <li><strong>MLA-specific handling</strong> (K2 uses multi-head latent attention): the
+            head-specific components <code>q^C, k^C</code> get <code>√γ_h</code> each; the head-specific
+            rotary part <code>q^R</code> absorbs the full <code>γ_h</code>; and the <em>shared</em>
+            rotary key <code>k^R</code> is left untouched so one head's clip never affects the others.</li>
+          <li><strong>It's a guard, not a controller.</strong> Clipping doesn't touch the current step's
+            forward/backward — it just rescales weights so the <em>next</em> step can't exceed τ. In the
+            K2 run, logits hit the τ=100 ceiling early, clipping was active for roughly the first 30% of
+            training, then max logits decayed on their own to a healthy 10–30 range and the clip went
+            dormant. Ablations showed no quality cost.</li>
+          <li><strong>vs QK-norm</strong>: QK-norm (normalizing q and k activations) solves the same
+            problem but changes the architecture and runs every step. QK-clip changes nothing in the
+            model and acts only when a head actually misbehaves — which is why it could be bolted onto a
+            1T-parameter run mid-design.</li>
+        </ul>
+
+        <div class="code-cell" data-id="of-qkclip">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">QK-clip: per-head logit capping, verified</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch
+torch.manual_seed(0)
+
+n_heads, head_dim, seqlen, d_model, tau = 4, 16, 32, 64, 100.0
+x = torch.randn(seqlen, d_model)
+Wq = torch.randn(n_heads, d_model, head_dim) * 0.3
+Wk = torch.randn(n_heads, d_model, head_dim) * 0.3
+Wq[2] *= 6; Wk[2] *= 6        # head 2 has drifted toward exploding logits
+
+def max_logit_per_head(Wq, Wk):
+    q = torch.einsum("sd,hdk->hsk", x, Wq)          # (n_heads, seqlen, head_dim)
+    k = torch.einsum("sd,hdk->hsk", x, Wk)
+    logits = q @ k.transpose(-2, -1) / head_dim ** 0.5
+    return logits.amax(dim=(-2, -1))                 # S_max per head
+
+s_before = max_logit_per_head(Wq, Wk)
+gamma = (tau / s_before).clamp(max=1.0)              # min(1, tau / S_max) per head
+Wq = Wq * gamma.sqrt()[:, None, None]                # sqrt(gamma) on W_q ...
+Wk = Wk * gamma.sqrt()[:, None, None]                # ... and sqrt(gamma) on W_k
+s_after = max_logit_per_head(Wq, Wk)
+
+print("S_max before:", s_before.round(decimals=1).tolist())
+print("gamma       :", gamma.round(decimals=3).tolist())
+print("S_max after :", s_after.round(decimals=1).tolist())
+# only the exploding head is touched (gamma<1); sqrt(gamma) on BOTH matrices
+# scales its bilinear logit by exactly gamma -> pinned to tau. Healthy heads: untouched.</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
+        <!-- ========================================================= -->
+        <h2>7. Muon at extreme scale — the distributed story</h2>
+        <p>
+          The subtlety nobody hits until they shard: Newton–Schulz needs the <strong>whole gradient
+          matrix</strong> of each weight, but ZeRO/FSDP shard gradients into flat, arbitrary chunks
+          (<a href="distributed.html">Distributed §2</a>). The production solutions:
+        </p>
+        <ul>
+          <li><strong>Distributed Muon</strong> (Moonlight): keep ZeRO-1-style sharding, then
+            all-gather each matrix's gradient shards just before its NS iteration, run NS redundantly
+            or on an owner rank, and release. Communication overhead is modest because NS runs on the
+            <em>momentum</em>, once per step.</li>
+          <li><strong>Muon-aware bucketing</strong> (DeepSeek-V4): assign ZeRO buckets so that
+            Muon-owned matrices stay gatherable as whole units, with MoE gradients communicated in
+            <strong>bf16 + stochastic rounding</strong> and summed locally in fp32 — cheap comms without
+            biased accumulation (<a href="numerics-precision.html">Numerics</a>).</li>
+          <li><strong>Refined NS schedules</strong>: V4 runs a hybrid — 8 steps of the tuned quintic
+            (3.4445, −4.7750, 2.0315) followed by 2 polish steps of (2, −1.5, 0.5) — buying a tighter
+            orthogonalization when the extra matmuls are affordable. The NS cost itself is small:
+            a handful of <code>(m×n)</code> matmuls per weight per step, in bf16.</li>
+          <li><strong>The AdamW exception list grows with the architecture</strong>: V4 keeps embeddings,
+            heads, RMSNorm gains <em>and</em> its mHC residual-mixing static weights on AdamW — anything
+            that isn't a plain linear map stays out of Muon.</li>
+        </ul>
+
+        <!-- ========================================================= -->
+        <h2>8. Choosing — the comparison</h2>
         <div class="table-wrap">
           <table>
             <thead><tr><th>Optimizer</th><th>State / param</th><th>Uses matrix structure?</th><th>Pitch</th></tr></thead>
@@ -268,8 +409,23 @@ print("   of UVᵀ). Every direction of the update gets ~equal scale, none domin
           (2) write Lion's sign update and state its memory/LR/weight-decay trade-offs; (3) explain
           Shampoo's Kronecker-factored preconditioner and why it's amortized, plus what SOAP adds;
           (4) explain Muon as momentum orthogonalization, implement Newton–Schulz, and cite the ~2×
-          efficiency + 1T-scale evidence; (5) know that Muon/Shampoo are 2D-only and pair with AdamW.</p>
+          efficiency + 1T-scale evidence; (5) recite the practical recipe — 2D-only routing, the
+          <code>0.2·√max(m,n)</code> RMS-matching scale, weight decay 0.1, μ=0.95 Nesterov, 5 NS steps
+          in bf16; (6) explain why Muon (not AdamW) explodes attention logits, and write QK-clip's
+          per-head <code>γ_h = min(1, τ/S_max)</code> with <code>√γ</code> on both W_q and W_k;
+          (7) describe the distributed story — the full-gradient-matrix requirement vs ZeRO, and the
+          gather/bucketing solutions.</p>
         </div>
+
+        <p class="footnote">
+          Sources: <a href="https://kellerjordan.github.io/posts/muon/">Jordan et al., Muon</a>;
+          <a href="https://arxiv.org/abs/2502.16982">Moonlight — Muon is Scalable for LLM Training</a>;
+          <a href="https://arxiv.org/abs/2507.20534">Kimi K2 technical report</a> (MuonClip / QK-clip,
+          §2 and Appendix D); <a href="https://arxiv.org/abs/2505.02222">Essential AI — Practical
+          Efficiency of Muon for Pretraining</a>;
+          <a href="https://arxiv.org/html/2606.19348v1">DeepSeek-V4 report</a> (hybrid NS schedule,
+          Muon-aware ZeRO bucketing).
+        </p>
 
         <div id="pager"></div>
       </main>
