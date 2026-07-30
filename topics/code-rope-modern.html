@@ -216,13 +216,133 @@ class LlamaModel(nn.Module):
 </script>
         </div>
 
+        <!-- ========================================================= -->
+        <h2>6. Beyond RoPE: NoPE and YaRN</h2>
+
+        <h3>NoPE — no positional encoding at all</h3>
+        <p>
+          A surprising fact: a <em>causal</em> decoder needs no explicit positional encoding to know
+          where tokens are. The causal mask already breaks permutation symmetry — position <code>t</code>
+          sees a different prefix than position <code>t+1</code>, and the model can (and does) learn to
+          recover position from that alone, e.g. by measuring how much attention mass a query collects
+          from the always-visible early tokens. Kazemnejad et al. (2023) showed NoPE decoders not only
+          train fine but <strong>length-generalize better</strong> than RoPE on algorithmic tasks —
+          there are no learned frequencies to go out-of-distribution at unseen lengths.
+        </p>
+        <div class="code-view" data-file="nope.py">
+<script type="text/x-python">
+# NoPE is a deletion, not an addition: same Attention module, skip the rotation.
+class NoPEAttention(Attention):
+    def forward(self, x, cos=None, sin=None):
+        batch, seqlen, d_model = x.shape
+        q = self.wq(x).view(batch, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.wk(x).view(batch, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.wv(x).view(batch, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        # no apply_rope(q, k, ...) -- position comes from the causal mask alone
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.wo(y.transpose(1, 2).contiguous().view(batch, seqlen, d_model))
+</script>
+        </div>
+        <p>
+          Production models use NoPE <em>selectively</em>, not wholesale: Llama 4's "iRoPE" interleaves
+          RoPE layers (local, chunked attention) with <strong>NoPE global-attention layers</strong> —
+          the position-free layers are the ones that extrapolate to very long context. Thinking
+          Machines' Inkling goes further and drops RoPE entirely in favor of a learned relative bias
+          (<a href="case-inkling-synthesis.html">case study</a>). The design intuition: rotation-based
+          position helps local precision, but at long range it mostly adds an extrapolation liability.
+        </p>
+
+        <h3>YaRN — extending a trained model's context</h3>
+        <p>
+          You trained at 4K and want 128K. Naive options both fail: extrapolating RoPE past trained
+          positions produces angles the model has never seen, and uniformly interpolating all positions
+          into the trained range (Position Interpolation) squeezes the <em>fast</em> dimensions so much
+          that nearby tokens become indistinguishable. <strong>YaRN</strong> (Peng et al., 2023) fixes
+          this by treating RoPE's dimensions <em>by wavelength</em> — "NTK-by-parts":
+        </p>
+        <ul>
+          <li><strong>High-frequency dims</strong> (wavelength ≪ trained context — they complete many
+            rotations): <em>don't touch them</em>. They encode local order, and interpolation would
+            destroy it.</li>
+          <li><strong>Low-frequency dims</strong> (wavelength ≥ trained context — under one full
+            rotation): <em>fully interpolate</em> (divide frequency by the scale factor <code>s</code>).
+            They encode coarse position and interpolate safely.</li>
+          <li><strong>In between</strong>: a linear ramp mixes the two.</li>
+          <li>Plus an <strong>attention temperature</strong>: scale cos/sin by
+            <code>mscale = 0.1·ln(s) + 1</code>, which sharpens logits to compensate for the longer
+            context's entropy increase.</li>
+        </ul>
+        <div class="code-view" data-file="yarn.py">
+<script type="text/x-python">
+import math
+
+def precompute_rope_yarn(head_dim, seqlen, orig_ctx, scale, base=10000.0,
+                         alpha=1.0, beta=32.0, device=None):
+    # scale = target_ctx / orig_ctx  (e.g. 262144 / 4096 = 64)
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+
+    # rotations each dim completes within the ORIGINAL context window
+    rotations = orig_ctx * inv_freq / (2 * math.pi)
+
+    # ramp: 0 where rotations >= beta (high freq -> keep), 1 where <= alpha (low freq -> interpolate)
+    interp = ((beta - rotations) / (beta - alpha)).clamp(0.0, 1.0)
+    inv_freq = inv_freq * (1 - interp) + (inv_freq / scale) * interp   # NTK-by-parts mix
+
+    t = torch.arange(seqlen, device=device).float()
+    freqs = torch.outer(t, inv_freq)
+    emb = torch.cat([freqs, freqs], dim=-1)
+
+    mscale = 0.1 * math.log(scale) + 1.0        # attention-temperature correction
+    return emb.cos() * mscale, emb.sin() * mscale   # drop-in for precompute_rope
+</script>
+        </div>
+        <p class="footnote">
+          Scaling cos/sin by <code>mscale</code> multiplies every q·k logit by <code>mscale²</code> —
+          the temperature applied where it's cheapest. In practice YaRN needs only a <em>brief</em>
+          fine-tune at the new length (or even works zero-shot at modest scales); Kimi K2.5 used YaRN
+          for its long-context activation to 262K (<a href="case-kimi.html">case study</a>).
+        </p>
+
+        <div class="code-cell" data-id="crm-yarn">
+          <div class="code-cell-toolbar">
+            <span class="code-cell-label">Which dims YaRN touches (PyTorch)</span>
+            <span class="spacer"></span>
+            <button class="btn btn-run">▶ Run</button>
+            <button class="btn btn-reset">Reset</button>
+          </div>
+          <textarea class="code-src" spellcheck="false">import torch, math
+
+head_dim, orig_ctx, scale, base = 128, 4096, 64, 10000.0   # 4K -> 262K
+alpha, beta = 1.0, 32.0
+
+inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+rotations = orig_ctx * inv_freq / (2 * math.pi)   # rotations inside the trained window
+interp = ((beta - rotations) / (beta - alpha)).clamp(0.0, 1.0)
+
+kept  = int((interp == 0).sum()); mixed = int(((interp > 0) & (interp < 1)).sum())
+full  = int((interp == 1).sum())
+print(f"of {head_dim//2} freq dims: {kept} kept as-is (fast/local), "
+      f"{mixed} ramp-mixed, {full} fully interpolated (slow/global)")
+print(f"attention mscale = {0.1 * math.log(scale) + 1.0:.3f}")
+
+# the failure modes YaRN avoids, at the extremes:
+i0, iN = 0, head_dim // 2 - 1
+print(f"\nfastest dim: {rotations[i0]:7.1f} rotations in 4K -> interpolating it would")
+print( "             compress neighbor angles ~64x (local order destroyed) -> keep")
+print(f"slowest dim: {rotations[iN]:7.3f} rotations in 4K -> extrapolating it would hit")
+print( "             angles never seen in training -> interpolate")</textarea>
+          <pre class="code-out" hidden></pre>
+        </div>
+
         <div class="callout insight">
           <div class="callout-title">Reading checklist</div>
           <p>
             Trace the differences from the standard GPT: RMSNorm (no mean/bias), RoPE applied to Q/K
             inside attention (no learned position table), SwiGLU's three matrices with the 8·dim/3 hidden
             size, and SDPA replacing the manual mask+softmax. These four swaps are essentially "GPT-2 →
-            Llama."
+            Llama." Then the two positional extremes: NoPE (delete the rotation — the causal mask alone
+            carries position, and it length-generalizes) and YaRN (stretch a trained model's context by
+            interpolating only the slow RoPE dims, plus the <code>0.1·ln(s)+1</code> temperature).
           </p>
         </div>
 
